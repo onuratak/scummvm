@@ -25,6 +25,12 @@
 #define FORBIDDEN_SYMBOL_EXCEPTION_stdin
 #define FORBIDDEN_SYMBOL_EXCEPTION_FILE
 
+#include <cmath>
+#include <cstring>
+#ifdef USE_SDL_NET
+#include <SDL_net.h>
+#endif
+
 #include "common/archive.h"
 #include "common/debug-channels.h"
 #include "common/file.h"
@@ -38,6 +44,7 @@
 #include "backends/keymapper/standard-actions.h"
 
 #include "graphics/renderer.h"
+#include "graphics/parallax.h"
 
 #if defined(USE_OPENGL_GAME) || defined(USE_OPENGL_SHADERS)
 #include "graphics/opengl/context.h"
@@ -83,6 +90,39 @@
 
 namespace Grim {
 
+static const uint32 kParallaxDebugOpentrackTimeoutMs = 1000;
+static const int kParallaxDebugOpentrackAxes = 6;
+
+static Graphics::Parallax::ScreenShiftConfig makeParallaxDebugScreenShiftConfig(float strength) {
+	Graphics::Parallax::ScreenShiftConfig config;
+	config.maxOffsetXPixels = 32.0f * strength;
+	config.maxOffsetYPixels = 18.0f * strength;
+	config.depthExponent = 1.6f;
+	config.minDepthWeight = 0.18f;
+	return config;
+}
+
+static const char *parallaxDebugInputSourceConfigValue(GrimEngine::ParallaxDebugInputSource source) {
+	switch (source) {
+	case GrimEngine::kParallaxDebugInputAuto:
+		return "auto";
+	case GrimEngine::kParallaxDebugInputOpentrack:
+		return "opentrack";
+	case GrimEngine::kParallaxDebugInputMouse:
+	default:
+		return "mouse";
+	}
+}
+
+static bool parallaxDebugPoseIsFinite(const double *pose) {
+	for (int i = 0; i < kParallaxDebugOpentrackAxes; ++i) {
+		if (!std::isfinite(pose[i]))
+			return false;
+	}
+
+	return true;
+}
+
 GrimEngine *g_grim = nullptr;
 GfxBase *g_driver = nullptr;
 int g_imuseState = -1;
@@ -109,8 +149,31 @@ GrimEngine::GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, C
 
 	// Set default settings
 	ConfMan.registerDefault("use_arb_shaders", true);
+	ConfMan.registerDefault("grim_parallax_test", false);
+	ConfMan.registerDefault("grim_parallax_test_auto", false);
+	ConfMan.registerDefault("grim_parallax_test_source", "mouse");
+	ConfMan.registerDefault("grim_parallax_test_strength", "0.35");
+	ConfMan.registerDefault("grim_parallax_test_opentrack_port", 4242);
+	ConfMan.registerDefault("grim_parallax_test_opentrack_range_x", "12.0");
+	ConfMan.registerDefault("grim_parallax_test_opentrack_range_y", "8.0");
+	ConfMan.registerDefault("grim_parallax_test_overlay", true);
 
 	_showFps = ConfMan.getBool("show_fps");
+	_parallaxDebugEnabled = (getGameType() == GType_GRIM) && ConfMan.getBool("grim_parallax_test");
+	_parallaxDebugStrength = CLIP<float>(ConfMan.getFloat("grim_parallax_test_strength"), 0.05f, 2.0f);
+	_parallaxDebugOpentrackPort = MAX(1, ConfMan.getInt("grim_parallax_test_opentrack_port"));
+	_parallaxDebugOpentrackRangeX = MAX(0.1f, ConfMan.getFloat("grim_parallax_test_opentrack_range_x"));
+	_parallaxDebugOpentrackRangeY = MAX(0.1f, ConfMan.getFloat("grim_parallax_test_opentrack_range_y"));
+	_parallaxDebugOverlayEnabled = ConfMan.getBool("grim_parallax_test_overlay");
+
+	Common::String parallaxSource = ConfMan.get("grim_parallax_test_source");
+	if (parallaxSource.equalsIgnoreCase("opentrack")) {
+		_parallaxDebugInputSource = kParallaxDebugInputOpentrack;
+	} else if (parallaxSource.equalsIgnoreCase("auto") || ConfMan.getBool("grim_parallax_test_auto")) {
+		_parallaxDebugInputSource = kParallaxDebugInputAuto;
+	} else {
+		_parallaxDebugInputSource = kParallaxDebugInputMouse;
+	}
 
 	_softRenderer = true;
 
@@ -200,6 +263,9 @@ GrimEngine::GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, C
 }
 
 GrimEngine::~GrimEngine() {
+	closeParallaxDebugOpentrackSocket();
+	closeParallaxDebugLog();
+
 	delete[] _controlsEnabled;
 	delete[] _controlsState;
 	delete[] _joyAxisPosition;
@@ -280,8 +346,11 @@ GfxBase *GrimEngine::createRenderer(int screenW, int screenH) {
 		availableRendererTypes &= ~Graphics::kRendererTypeTinyGL;
 	}
 
-	// For Grim Fandango, OpenGL renderer without shaders is preferred if available
-	if (desiredRendererType == Graphics::kRendererTypeDefault &&
+	// For Grim Fandango, OpenGL renderer without shaders is preferred if available,
+	// except when the parallax prototype is enabled because the backdrop depth path
+	// currently requires the shader renderer.
+	if (!_parallaxDebugEnabled &&
+		desiredRendererType == Graphics::kRendererTypeDefault &&
 		(availableRendererTypes & Graphics::kRendererTypeOpenGL) &&
 	    getGameType() == GType_GRIM) {
 		availableRendererTypes &= ~Graphics::kRendererTypeOpenGLShaders;
@@ -846,6 +915,9 @@ void GrimEngine::luaUpdate() {
 void GrimEngine::updateDisplayScene() {
 	_doFlip = true;
 
+	updateParallaxDebugAuto();
+	updateParallaxDebugOpentrack();
+
 	if (_mode == SmushMode) {
 		if (g_movie->isPlaying()) {
 			_movieTime = g_movie->getMovieTime();
@@ -979,6 +1051,9 @@ void GrimEngine::doFlip() {
 	if (_showFps && _mode != DrawMode)
 		g_driver->drawEmergString(550, 25, _fps, Color(255, 255, 255));
 
+	drawParallaxDebugOverlay();
+	writeParallaxDebugLogFrame();
+
 	if (_flipEnable)
 		g_driver->flipBuffer();
 
@@ -1063,6 +1138,12 @@ void GrimEngine::mainLoop() {
 			// Handle any buttons, keys and joystick operations
 			Common::EventType type = event.type;
 			if (type == Common::EVENT_KEYDOWN || type == Common::EVENT_KEYUP) {
+				if (isParallaxDebugHotkey(event.kbd.keycode)) {
+					if (type == Common::EVENT_KEYDOWN)
+						handleParallaxDebugHotkey(event.kbd);
+					continue;
+				}
+
 				if (type == Common::EVENT_KEYDOWN) {
 					// Ignore everything but ESC when movies are playing
 					// This matches the retail and demo versions of EMI
@@ -1128,6 +1209,7 @@ void GrimEngine::mainLoop() {
 			if (type == Common::EVENT_MOUSEMOVE) {
 				_cursorX = event.mouse.x;
 				_cursorY = event.mouse.y;
+				updateParallaxDebugMouse(_cursorX, _cursorY);
 				handleMouseAxis(0, _cursorX);
 				handleMouseAxis(1, _cursorY);
 			}
@@ -1733,6 +1815,619 @@ void GrimEngine::setSaveMetaData(const char *meta1, int meta2, const char *meta3
 	_saveMeta1 = meta1;
 	_saveMeta2 = meta2;
 	_saveMeta3 = meta3;
+}
+
+bool GrimEngine::isParallaxDebugHotkey(Common::KeyCode keycode) const {
+	if (getGameType() != GType_GRIM)
+		return false;
+
+	switch (keycode) {
+	case Common::KEYCODE_F6:
+	case Common::KEYCODE_F7:
+	case Common::KEYCODE_F8:
+	case Common::KEYCODE_F9:
+	case Common::KEYCODE_F10:
+	case Common::KEYCODE_F11:
+	case Common::KEYCODE_LEFTBRACKET:
+	case Common::KEYCODE_RIGHTBRACKET:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void GrimEngine::resetParallaxDebugInput() {
+	_parallaxDebugInputX = 0.0f;
+	_parallaxDebugInputY = 0.0f;
+	_parallaxDebugPhase = 0.0f;
+
+	if (_parallaxDebugInputSource == kParallaxDebugInputOpentrack && _parallaxDebugOpentrackHasPose) {
+		for (int i = 0; i < kParallaxDebugOpentrackAxes; ++i)
+			_parallaxDebugOpentrackCenter[i] = _parallaxDebugOpentrackPose[i];
+	}
+}
+
+void GrimEngine::setParallaxDebugInputSource(ParallaxDebugInputSource source) {
+	_parallaxDebugInputSource = source;
+	ConfMan.set("grim_parallax_test_source", parallaxDebugInputSourceConfigValue(source));
+	ConfMan.setBool("grim_parallax_test_auto", source == kParallaxDebugInputAuto);
+
+	switch (source) {
+	case kParallaxDebugInputMouse:
+		updateParallaxDebugMouse(_cursorX, _cursorY);
+		g_system->displayMessageOnOSD(Common::U32String("Grim parallax mouse input active. F7 auto, F9 opentrack."));
+		break;
+	case kParallaxDebugInputAuto:
+		g_system->displayMessageOnOSD(Common::U32String("Grim parallax auto motion active. F7 mouse, F9 opentrack."));
+		break;
+	case kParallaxDebugInputOpentrack:
+		if (!ensureParallaxDebugOpentrackSocket()) {
+			_parallaxDebugInputSource = kParallaxDebugInputMouse;
+			ConfMan.set("grim_parallax_test_source", "mouse");
+			ConfMan.setBool("grim_parallax_test_auto", false);
+			updateParallaxDebugMouse(_cursorX, _cursorY);
+			g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax opentrack bind failed on UDP %d. Mouse input active.", _parallaxDebugOpentrackPort));
+			return;
+		}
+
+		resetParallaxDebugInput();
+		g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax opentrack active on UDP %d. F8 recenter, F9 mouse.", _parallaxDebugOpentrackPort));
+		break;
+	}
+}
+
+bool GrimEngine::ensureParallaxDebugOpentrackSocket() {
+	if (_parallaxDebugOpentrackSocketReady)
+		return true;
+
+#ifdef USE_SDL_NET
+	UDPsocket udpSocket = SDLNet_UDP_Open((uint16)_parallaxDebugOpentrackPort);
+	if (!udpSocket)
+		return false;
+
+	UDPpacket *udpPacket = SDLNet_AllocPacket(sizeof(double) * kParallaxDebugOpentrackAxes);
+	if (!udpPacket) {
+		SDLNet_UDP_Close(udpSocket);
+		return false;
+	}
+
+	_parallaxDebugOpentrackSocket = udpSocket;
+	_parallaxDebugOpentrackPacket = udpPacket;
+#else
+	return false;
+#endif
+
+	_parallaxDebugOpentrackSocketReady = true;
+	return true;
+}
+
+void GrimEngine::closeParallaxDebugOpentrackSocket() {
+	if (!_parallaxDebugOpentrackSocketReady)
+		return;
+
+#ifdef USE_SDL_NET
+	if (_parallaxDebugOpentrackPacket)
+		SDLNet_FreePacket(reinterpret_cast<UDPpacket *>(_parallaxDebugOpentrackPacket));
+	if (_parallaxDebugOpentrackSocket)
+		SDLNet_UDP_Close(reinterpret_cast<UDPsocket>(_parallaxDebugOpentrackSocket));
+#endif
+
+	_parallaxDebugOpentrackSocket = nullptr;
+	_parallaxDebugOpentrackPacket = nullptr;
+	_parallaxDebugOpentrackSocketReady = false;
+	_parallaxDebugOpentrackHasPose = false;
+	_parallaxDebugOpentrackAnnounced = false;
+}
+
+bool GrimEngine::toggleParallaxDebugLog() {
+	if (_parallaxDebugLogEnabled) {
+		closeParallaxDebugLog();
+		return true;
+	}
+
+	Common::DumpFile *logFile = new Common::DumpFile();
+	if (!logFile->open(Common::Path("grim_parallax_debug.csv"))) {
+		delete logFile;
+		return false;
+	}
+
+	static const char *header =
+		"frame,millis,input_source,input_x,input_y,strength,plane_shift_x,plane_shift_y,"
+		"camera_pos_x,camera_pos_y,camera_pos_z,camera_interest_x,camera_interest_y,camera_interest_z,"
+		"camera_pos_final_x,camera_pos_final_y,camera_pos_final_z,camera_interest_final_x,camera_interest_final_y,camera_interest_final_z,"
+		"camera_offset_x,camera_offset_y,camera_offset_z,fov,roll,screen_plane_distance,"
+		"frustum_shift_near_x,frustum_shift_near_y,frustum_left,frustum_right,frustum_bottom,frustum_top,"
+		"depth_aware_background_active,bg_shift_near_x,bg_shift_near_y,bg_shift_zero_x,bg_shift_zero_y,bg_shift_far_x,bg_shift_far_y,bg_offset_x,bg_offset_y,"
+		"layer_bg_x,layer_bg_y,layer_state_x,layer_state_y,layer_under_x,layer_under_y,layer_over_x,layer_over_y,"
+		"tracked_actor_name,tracked_actor_x1,tracked_actor_y1,tracked_actor_x2,tracked_actor_y2,"
+		"opentrack_x,opentrack_y,opentrack_z,opentrack_yaw,opentrack_pitch,opentrack_roll,"
+		"opentrack_center_x,opentrack_center_y,opentrack_center_z,set_name,setup_name\n";
+	logFile->write(header, (uint32)strlen(header));
+	logFile->flush();
+
+	_parallaxDebugLogFile = logFile;
+	_parallaxDebugLogEnabled = true;
+	_parallaxDebugLogFrameCounter = 0;
+	return true;
+}
+
+void GrimEngine::closeParallaxDebugLog() {
+	if (_parallaxDebugLogFile) {
+		Common::DumpFile *logFile = reinterpret_cast<Common::DumpFile *>(_parallaxDebugLogFile);
+		logFile->flush();
+		logFile->close();
+		delete logFile;
+	}
+
+	_parallaxDebugLogFile = nullptr;
+	_parallaxDebugLogEnabled = false;
+}
+
+void GrimEngine::writeParallaxDebugLogFrame() {
+	if (!_parallaxDebugEnabled || !_parallaxDebugLogEnabled || !_parallaxDebugLogFile || getGameType() != GType_GRIM)
+		return;
+
+	Common::DumpFile *logFile = reinterpret_cast<Common::DumpFile *>(_parallaxDebugLogFile);
+	Set *currSet = getCurrSet();
+	Set::Setup *setup = currSet ? currSet->getCurrSetup() : nullptr;
+
+	const char *srcName = "mouse";
+	if (_parallaxDebugInputSource == kParallaxDebugInputAuto)
+		srcName = "auto";
+	else if (_parallaxDebugInputSource == kParallaxDebugInputOpentrack)
+		srcName = "opentrack";
+
+	const Math::Vector2d planeShift = getParallaxDebugCameraPlaneOffset();
+	Math::Vector3d cameraPos;
+	Math::Vector3d cameraInterest;
+	Math::Vector3d cameraPosFinal;
+	Math::Vector3d cameraInterestFinal;
+	Math::Vector3d cameraOffset;
+	float fov = 0.0f;
+	float roll = 0.0f;
+	float screenPlaneDistance = 0.0f;
+	Common::String setName;
+	Common::String setupName;
+
+	if (setup) {
+		cameraPos = setup->_pos;
+		cameraInterest = setup->_interest;
+		cameraOffset = getParallaxDebugCameraOffset(cameraPos, cameraInterest, setup->_roll);
+		cameraPosFinal = cameraPos + cameraOffset;
+		cameraInterestFinal = cameraInterest + cameraOffset;
+		fov = setup->_fov;
+		roll = setup->_roll;
+		screenPlaneDistance = (cameraInterest - cameraPos).getMagnitude();
+		setupName = setup->_name;
+	}
+
+	if (currSet)
+		setName = currSet->getName();
+
+	const float nearClip = 0.01f;
+	const float frustumHalfWidth = nearClip * tanf((fov * ((float)M_PI / 180.0f)) * 0.5f);
+	const float frustumHalfHeight = frustumHalfWidth * 0.75f;
+	const float frustumShiftNearX = screenPlaneDistance > 0.0001f ? -(planeShift.getX() * nearClip) / screenPlaneDistance : 0.0f;
+	const float frustumShiftNearY = screenPlaneDistance > 0.0001f ? -(planeShift.getY() * nearClip) / screenPlaneDistance : 0.0f;
+	const float frustumLeft = -frustumHalfWidth + frustumShiftNearX;
+	const float frustumRight = frustumHalfWidth + frustumShiftNearX;
+	const float frustumBottom = -frustumHalfHeight + frustumShiftNearY;
+	const float frustumTop = frustumHalfHeight + frustumShiftNearY;
+
+	const bool depthAwareBackgroundActive =
+		_parallaxDebugEnabled &&
+		getGameType() == GType_GRIM &&
+		g_driver->supportsShaders() &&
+		setup &&
+		setup->_bkgndBm &&
+		setup->_bkgndZBm;
+
+	Graphics::Parallax::PerspectiveShiftConfig perspectiveConfig;
+	perspectiveConfig.horizontalFovDegrees = fov;
+	perspectiveConfig.nearClip = nearClip;
+	perspectiveConfig.farClip = 3276.8f;
+	perspectiveConfig.screenPlaneDistance = screenPlaneDistance;
+	perspectiveConfig.aspectRatio = 0.75f;
+	perspectiveConfig.viewportWidthPixels = (float)g_driver->getScreenWidth();
+	perspectiveConfig.viewportHeightPixels = (float)g_driver->getScreenHeight();
+
+	Math::Vector2d bgShiftNear;
+	Math::Vector2d bgShiftZero;
+	Math::Vector2d bgShiftFar;
+	if (screenPlaneDistance > 0.0001f) {
+		bgShiftNear = Graphics::Parallax::computePerspectivePixelShift(planeShift, screenPlaneDistance * 0.5f, perspectiveConfig);
+		bgShiftZero = Graphics::Parallax::computePerspectivePixelShift(planeShift, screenPlaneDistance, perspectiveConfig);
+		bgShiftFar = Graphics::Parallax::computePerspectivePixelShift(planeShift, screenPlaneDistance * 2.0f, perspectiveConfig);
+	}
+
+	int bgOffX = 0, bgOffY = 0;
+	int layerBgX = 0, layerBgY = 0;
+	int layerStateX = 0, layerStateY = 0;
+	int layerUnderX = 0, layerUnderY = 0;
+	int layerOverX = 0, layerOverY = 0;
+	getParallaxDebugScreenOffset(0.70f, bgOffX, bgOffY);
+	getParallaxDebugScreenOffset(0.80f, layerBgX, layerBgY);
+	getParallaxDebugScreenOffset(0.90f, layerStateX, layerStateY);
+	getParallaxDebugScreenOffset(1.00f, layerUnderX, layerUnderY);
+	getParallaxDebugScreenOffset(1.10f, layerOverX, layerOverY);
+
+	Common::String trackedActorName;
+	Common::Point actorP1(-1, -1);
+	Common::Point actorP2(-1, -1);
+	Actor *trackedActor = _selectedActor;
+	if (!trackedActor) {
+		for (Actor *actor : _activeActors) {
+			if (actor && actor->getName().equalsIgnoreCase("manny")) {
+				trackedActor = actor;
+				break;
+			}
+		}
+	}
+	if (!trackedActor && !_activeActors.empty())
+		trackedActor = _activeActors.front();
+	if (trackedActor) {
+		trackedActorName = trackedActor->getName();
+		g_driver->getActorScreenBBox(trackedActor, actorP1, actorP2);
+	}
+
+	Common::String line = Common::String::format(
+		"%u,%u,%s,%.6f,%.6f,%.6f,%.6f,%.6f,"
+		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+		"%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,"
+		"%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d,%d,%d,"
+		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+		"%.6f,%.6f,%.6f,%s,%s\n",
+		_parallaxDebugLogFrameCounter++, g_system->getMillis(), srcName,
+		_parallaxDebugInputX, _parallaxDebugInputY, _parallaxDebugStrength, planeShift.getX(), planeShift.getY(),
+		cameraPos.x(), cameraPos.y(), cameraPos.z(), cameraInterest.x(), cameraInterest.y(), cameraInterest.z(),
+		cameraPosFinal.x(), cameraPosFinal.y(), cameraPosFinal.z(), cameraInterestFinal.x(), cameraInterestFinal.y(), cameraInterestFinal.z(),
+		cameraOffset.x(), cameraOffset.y(), cameraOffset.z(), fov, roll, screenPlaneDistance,
+		frustumShiftNearX, frustumShiftNearY, frustumLeft, frustumRight, frustumBottom, frustumTop,
+		depthAwareBackgroundActive ? 1 : 0,
+		bgShiftNear.getX(), bgShiftNear.getY(), bgShiftZero.getX(), bgShiftZero.getY(), bgShiftFar.getX(), bgShiftFar.getY(), bgOffX, bgOffY,
+		layerBgX, layerBgY, layerStateX, layerStateY, layerUnderX, layerUnderY, layerOverX, layerOverY,
+		trackedActorName.c_str(), actorP1.x, actorP1.y, actorP2.x, actorP2.y,
+		_parallaxDebugOpentrackPose[0], _parallaxDebugOpentrackPose[1], _parallaxDebugOpentrackPose[2],
+		_parallaxDebugOpentrackPose[3], _parallaxDebugOpentrackPose[4], _parallaxDebugOpentrackPose[5],
+		_parallaxDebugOpentrackCenter[0], _parallaxDebugOpentrackCenter[1], _parallaxDebugOpentrackCenter[2],
+		setName.c_str(), setupName.c_str());
+	logFile->write(line.c_str(), (uint32)line.size());
+	if ((_parallaxDebugLogFrameCounter % 30) == 0)
+		logFile->flush();
+}
+
+bool GrimEngine::handleParallaxDebugHotkey(const Common::KeyState &key) {
+	if (getGameType() != GType_GRIM)
+		return false;
+
+	switch (key.keycode) {
+	case Common::KEYCODE_F6:
+		_parallaxDebugEnabled = !_parallaxDebugEnabled;
+		if (!_parallaxDebugEnabled) {
+			resetParallaxDebugInput();
+			_parallaxDebugOpentrackAnnounced = false;
+			closeParallaxDebugLog();
+		}
+		ConfMan.setBool("grim_parallax_test", _parallaxDebugEnabled);
+		// Recreate the renderer so the default Grim backend selection can switch
+		// between plain OpenGL and the shader path when the prototype is toggled.
+		_changeHardwareState = true;
+		g_system->displayMessageOnOSD(_parallaxDebugEnabled ?
+			Common::U32String("Grim parallax test on. F7 auto, F8 center, F9 opentrack, F10 CSV, F11 overlay, [ / ] strength.") :
+			Common::U32String("Grim parallax test off."));
+		return true;
+
+	case Common::KEYCODE_F7:
+		if (!_parallaxDebugEnabled)
+			return true;
+		setParallaxDebugInputSource(_parallaxDebugInputSource == kParallaxDebugInputAuto ?
+			kParallaxDebugInputMouse : kParallaxDebugInputAuto);
+		return true;
+
+	case Common::KEYCODE_F8:
+		if (!_parallaxDebugEnabled)
+			return true;
+		resetParallaxDebugInput();
+		g_system->displayMessageOnOSD(_parallaxDebugInputSource == kParallaxDebugInputOpentrack ?
+			Common::U32String("Grim parallax opentrack recentered.") :
+			Common::U32String("Grim parallax recentered."));
+		return true;
+
+	case Common::KEYCODE_F9:
+		if (!_parallaxDebugEnabled)
+			return true;
+		setParallaxDebugInputSource(_parallaxDebugInputSource == kParallaxDebugInputOpentrack ?
+			kParallaxDebugInputMouse : kParallaxDebugInputOpentrack);
+		return true;
+
+	case Common::KEYCODE_F10:
+		if (!_parallaxDebugEnabled)
+			return true;
+		if (toggleParallaxDebugLog()) {
+			g_system->displayMessageOnOSD(_parallaxDebugLogEnabled ?
+				Common::U32String("Grim parallax CSV logging on: grim_parallax_debug.csv") :
+				Common::U32String("Grim parallax CSV logging off."));
+		} else {
+			g_system->displayMessageOnOSD(Common::U32String("Grim parallax CSV logging failed."));
+		}
+		return true;
+
+	case Common::KEYCODE_F11:
+		if (!_parallaxDebugEnabled)
+			return true;
+		_parallaxDebugOverlayEnabled = !_parallaxDebugOverlayEnabled;
+		ConfMan.setBool("grim_parallax_test_overlay", _parallaxDebugOverlayEnabled);
+		g_system->displayMessageOnOSD(_parallaxDebugOverlayEnabled ?
+			Common::U32String("Grim parallax overlay on.") :
+			Common::U32String("Grim parallax overlay off."));
+		return true;
+
+	case Common::KEYCODE_LEFTBRACKET:
+		if (!_parallaxDebugEnabled)
+			return true;
+		_parallaxDebugStrength = MAX(0.05f, _parallaxDebugStrength - 0.05f);
+		ConfMan.setFloat("grim_parallax_test_strength", _parallaxDebugStrength);
+		g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax strength %.2f", _parallaxDebugStrength));
+		return true;
+
+	case Common::KEYCODE_RIGHTBRACKET:
+		if (!_parallaxDebugEnabled)
+			return true;
+		_parallaxDebugStrength = MIN(2.0f, _parallaxDebugStrength + 0.05f);
+		ConfMan.setFloat("grim_parallax_test_strength", _parallaxDebugStrength);
+		g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax strength %.2f", _parallaxDebugStrength));
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+void GrimEngine::updateParallaxDebugMouse(int x, int y) {
+	if (!_parallaxDebugEnabled || _parallaxDebugInputSource != kParallaxDebugInputMouse)
+		return;
+
+	const int width = MAX<int>(1, g_system->getWidth());
+	const int height = MAX<int>(1, g_system->getHeight());
+	const float normalizedX = ((float)x / (float)width) * 2.0f - 1.0f;
+	const float normalizedY = ((float)y / (float)height) * 2.0f - 1.0f;
+	_parallaxDebugInputX = CLIP(normalizedX, -1.0f, 1.0f);
+	_parallaxDebugInputY = CLIP(-normalizedY, -1.0f, 1.0f);
+}
+
+void GrimEngine::updateParallaxDebugAuto() {
+	if (!_parallaxDebugEnabled || _parallaxDebugInputSource != kParallaxDebugInputAuto)
+		return;
+
+	const float deltaSeconds = MAX(_frameTime, 16u) / 1000.0f;
+	_parallaxDebugPhase += deltaSeconds;
+	_parallaxDebugInputX = sinf(_parallaxDebugPhase * 0.9f);
+	_parallaxDebugInputY = cosf(_parallaxDebugPhase * 0.6f) * 0.5f;
+}
+
+void GrimEngine::updateParallaxDebugOpentrack() {
+	if (!_parallaxDebugEnabled || _parallaxDebugInputSource != kParallaxDebugInputOpentrack)
+		return;
+
+	if (!ensureParallaxDebugOpentrackSocket())
+		return;
+
+	double pose[kParallaxDebugOpentrackAxes];
+	bool receivedPose = false;
+
+#ifdef USE_SDL_NET
+	UDPsocket udpSocket = reinterpret_cast<UDPsocket>(_parallaxDebugOpentrackSocket);
+	UDPpacket *udpPacket = reinterpret_cast<UDPpacket *>(_parallaxDebugOpentrackPacket);
+	for (;;) {
+		if (SDLNet_UDP_Recv(udpSocket, udpPacket) != 1)
+			break;
+
+		if (udpPacket->len == sizeof(pose)) {
+			memcpy(pose, udpPacket->data, sizeof(pose));
+		} else {
+			continue;
+		}
+
+		if (parallaxDebugPoseIsFinite(pose)) {
+			for (int i = 0; i < kParallaxDebugOpentrackAxes; ++i)
+				_parallaxDebugOpentrackPose[i] = pose[i];
+			receivedPose = true;
+		}
+	}
+#else
+	return;
+#endif
+
+	if (receivedPose) {
+		if (!_parallaxDebugOpentrackHasPose) {
+			for (int i = 0; i < kParallaxDebugOpentrackAxes; ++i)
+				_parallaxDebugOpentrackCenter[i] = _parallaxDebugOpentrackPose[i];
+		}
+
+		_parallaxDebugOpentrackHasPose = true;
+		_parallaxDebugOpentrackLastPacketMillis = g_system->getMillis();
+
+		if (!_parallaxDebugOpentrackAnnounced) {
+			_parallaxDebugOpentrackAnnounced = true;
+			g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax receiving opentrack pose on UDP %d.", _parallaxDebugOpentrackPort));
+		}
+	}
+
+	if (!_parallaxDebugOpentrackHasPose)
+		return;
+
+	if (g_system->getMillis() - _parallaxDebugOpentrackLastPacketMillis > kParallaxDebugOpentrackTimeoutMs) {
+		_parallaxDebugInputX *= 0.85f;
+		_parallaxDebugInputY *= 0.85f;
+		return;
+	}
+
+	// Webcam head tracking commonly reports lateral translation with the opposite
+	// polarity from our mouse/debug path, so flip X here to keep the scene response
+	// consistent across input sources.
+	const float targetX = CLIP<float>(-(float)(_parallaxDebugOpentrackPose[0] - _parallaxDebugOpentrackCenter[0]) / _parallaxDebugOpentrackRangeX, -1.0f, 1.0f);
+	const float targetY = CLIP<float>((float)(_parallaxDebugOpentrackPose[1] - _parallaxDebugOpentrackCenter[1]) / _parallaxDebugOpentrackRangeY, -1.0f, 1.0f);
+	const float blend = CLIP<float>(MAX(_frameTime, 16u) / 80.0f, 0.15f, 1.0f);
+	_parallaxDebugInputX += (targetX - _parallaxDebugInputX) * blend;
+	_parallaxDebugInputY += (targetY - _parallaxDebugInputY) * blend;
+}
+
+Math::Vector3d GrimEngine::getParallaxDebugCameraOffset(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) const {
+	if (!_parallaxDebugEnabled)
+		return Math::Vector3d();
+
+	Math::Vector3d forward = interest - pos;
+	if (forward.getSquareMagnitude() < 0.0001f)
+		return Math::Vector3d();
+	forward.normalize();
+
+	Math::Vector3d up(0.0f, 0.0f, 1.0f);
+	const float rollRadians = -roll * (float)M_PI / 180.0f;
+	const float cosRoll = cosf(rollRadians);
+	const float sinRoll = sinf(rollRadians);
+	up = up * cosRoll + Math::Vector3d::crossProduct(forward, up) * sinRoll +
+		forward * Math::Vector3d::dotProduct(forward, up) * (1.0f - cosRoll);
+	up.normalize();
+
+	Math::Vector3d right = Math::Vector3d::crossProduct(forward, up);
+	if (right.getSquareMagnitude() < 0.0001f)
+		return Math::Vector3d();
+	right.normalize();
+
+	const float lateralOffset = _parallaxDebugInputX * _parallaxDebugStrength * 0.75f;
+	const float verticalOffset = _parallaxDebugInputY * _parallaxDebugStrength * 0.55f;
+	return right * lateralOffset + up * verticalOffset;
+}
+
+Math::Vector2d GrimEngine::getParallaxDebugCameraPlaneOffset() const {
+	if (!_parallaxDebugEnabled)
+		return Math::Vector2d();
+
+	return Math::Vector2d(
+		_parallaxDebugInputX * _parallaxDebugStrength * 0.75f,
+		_parallaxDebugInputY * _parallaxDebugStrength * 0.55f
+	);
+}
+
+void GrimEngine::getParallaxDebugScreenOffset(float factor, int &x, int &y) const {
+	x = 0;
+	y = 0;
+
+	if (!_parallaxDebugEnabled)
+		return;
+
+	const Graphics::Parallax::ScreenShiftConfig config = makeParallaxDebugScreenShiftConfig(_parallaxDebugStrength);
+	const Math::Vector2d offset = Graphics::Parallax::computePixelOffset(_parallaxDebugInputX, _parallaxDebugInputY, factor, config);
+	x = (int)roundf(offset.getX());
+	y = (int)roundf(offset.getY());
+}
+
+void GrimEngine::drawParallaxDebugOverlay() {
+	if (!_parallaxDebugEnabled || !_parallaxDebugOverlayEnabled || getGameType() != GType_GRIM)
+		return;
+
+	char buf[128];
+	int y = 40;
+	const int lineH = 14;
+	const int x = 10;
+	const Color cyan(0, 255, 255);
+	const Color yellow(255, 255, 0);
+	const Color green(0, 255, 0);
+	const Color white(255, 255, 255);
+
+	// Input source and raw values
+	const char *srcName = "mouse";
+	if (_parallaxDebugInputSource == kParallaxDebugInputAuto)
+		srcName = "auto";
+	else if (_parallaxDebugInputSource == kParallaxDebugInputOpentrack)
+		srcName = "opentrack";
+
+	snprintf(buf, sizeof(buf), "PX src=%s str=%.2f", srcName, _parallaxDebugStrength);
+	g_driver->drawEmergString(x, y, buf, cyan);
+	y += lineH;
+
+	snprintf(buf, sizeof(buf), "PX log=%s file=grim_parallax_debug.csv", _parallaxDebugLogEnabled ? "on" : "off");
+	g_driver->drawEmergString(x, y, buf, cyan);
+	y += lineH;
+
+	snprintf(buf, sizeof(buf), "PX input  X=%+.3f Y=%+.3f", _parallaxDebugInputX, _parallaxDebugInputY);
+	g_driver->drawEmergString(x, y, buf, yellow);
+	y += lineH;
+
+	// Camera plane shift (what drives the off-axis frustum)
+	const Math::Vector2d planeShift = getParallaxDebugCameraPlaneOffset();
+	snprintf(buf, sizeof(buf), "PX camShf X=%+.4f Y=%+.4f", planeShift.getX(), planeShift.getY());
+	g_driver->drawEmergString(x, y, buf, yellow);
+	y += lineH;
+
+	// Camera info from current setup
+	Set *currSet = getCurrSet();
+	if (currSet && currSet->getCurrSetup()) {
+		Set::Setup *setup = currSet->getCurrSetup();
+		const Math::Vector3d &pos = setup->_pos;
+		const Math::Vector3d &interest = setup->_interest;
+		const float dist = (interest - pos).getMagnitude();
+
+		snprintf(buf, sizeof(buf), "PX camPos  %+.1f %+.1f %+.1f", pos.x(), pos.y(), pos.z());
+		g_driver->drawEmergString(x, y, buf, white);
+		y += lineH;
+
+		snprintf(buf, sizeof(buf), "PX camInt  %+.1f %+.1f %+.1f", interest.x(), interest.y(), interest.z());
+		g_driver->drawEmergString(x, y, buf, white);
+		y += lineH;
+
+		snprintf(buf, sizeof(buf), "PX fov=%.1f dist=%.2f roll=%.1f", setup->_fov, dist, setup->_roll);
+		g_driver->drawEmergString(x, y, buf, white);
+		y += lineH;
+
+		// 3D camera offset applied
+		const Math::Vector3d camOffset = getParallaxDebugCameraOffset(pos, interest, setup->_roll);
+		snprintf(buf, sizeof(buf), "PX cam3D   %+.3f %+.3f %+.3f", camOffset.x(), camOffset.y(), camOffset.z());
+		g_driver->drawEmergString(x, y, buf, green);
+		y += lineH;
+	}
+
+	// Background offsets (non-shader path)
+	int bgOffX = 0, bgOffY = 0;
+	getParallaxDebugScreenOffset(0.70f, bgOffX, bgOffY);
+	snprintf(buf, sizeof(buf), "PX bg2D    dX=%+d dY=%+d (f=0.70)", bgOffX, bgOffY);
+	g_driver->drawEmergString(x, y, buf, green);
+	y += lineH;
+
+	// Layer offsets
+	static const struct { const char *name; float factor; } layers[] = {
+		{ "BKGND", 0.80f },
+		{ "STATE", 0.90f },
+		{ "UNDER", 1.00f },
+		{ "OVERL", 1.10f },
+	};
+	for (int i = 0; i < 4; ++i) {
+		int lx = 0, ly = 0;
+		getParallaxDebugScreenOffset(layers[i].factor, lx, ly);
+		snprintf(buf, sizeof(buf), "PX %-5s   dX=%+d dY=%+d (f=%.2f)", layers[i].name, lx, ly, layers[i].factor);
+		g_driver->drawEmergString(x, y, buf, green);
+		y += lineH;
+	}
+
+	// Opentrack raw pose if active
+	if (_parallaxDebugInputSource == kParallaxDebugInputOpentrack && _parallaxDebugOpentrackHasPose) {
+		snprintf(buf, sizeof(buf), "OT pos %+.1f %+.1f %+.1f",
+			_parallaxDebugOpentrackPose[0], _parallaxDebugOpentrackPose[1], _parallaxDebugOpentrackPose[2]);
+		g_driver->drawEmergString(x, y, buf, cyan);
+		y += lineH;
+
+		snprintf(buf, sizeof(buf), "OT rot %+.1f %+.1f %+.1f",
+			_parallaxDebugOpentrackPose[3], _parallaxDebugOpentrackPose[4], _parallaxDebugOpentrackPose[5]);
+		g_driver->drawEmergString(x, y, buf, cyan);
+		y += lineH;
+
+		snprintf(buf, sizeof(buf), "OT ctr %+.1f %+.1f %+.1f",
+			_parallaxDebugOpentrackCenter[0], _parallaxDebugOpentrackCenter[1], _parallaxDebugOpentrackCenter[2]);
+		g_driver->drawEmergString(x, y, buf, cyan);
+		y += lineH;
+	}
 }
 
 } // end of namespace Grim

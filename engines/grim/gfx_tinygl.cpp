@@ -109,12 +109,19 @@ const char *GfxTinyGL::getVideoDeviceName() {
 	return "Software Renderer";
 }
 
-void GfxTinyGL::setupCameraFrustum(float fov, float nclip, float fclip) {
+void GfxTinyGL::setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift, float screenPlaneDistance) {
 	tglMatrixMode(TGL_PROJECTION);
 	tglLoadIdentity();
 
 	float right = nclip * tan(fov / 2 * ((float)M_PI / 180));
-	tglFrustumf(-right, right, -right * 0.75f, right * 0.75f, nclip, fclip);
+	float top = right * 0.75f;
+	float shiftX = 0.0f;
+	float shiftY = 0.0f;
+	if (screenPlaneDistance > 0.0001f) {
+		shiftX = -(cameraPlaneShift.getX() * nclip) / screenPlaneDistance;
+		shiftY = -(cameraPlaneShift.getY() * nclip) / screenPlaneDistance;
+	}
+	tglFrustumf(-right + shiftX, right + shiftX, -top + shiftY, top + shiftY, nclip, fclip);
 
 	tglMatrixMode(TGL_MODELVIEW);
 	tglLoadIdentity();

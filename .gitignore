@@ -308,3 +308,6 @@ __pycache__/
 
 #Ignore vcpkg generated files
 /vcpkg_installed/
+
+# Ignore locally downloaded test shader packs
+/external-shaders/

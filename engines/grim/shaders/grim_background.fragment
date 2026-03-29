@@ -3,7 +3,48 @@ in vec2 Texcoord;
 OUTPUT
 
 uniform sampler2D tex;
+uniform sampler2D texZBuf;
+uniform UBOOL useParallax;
+uniform vec2 texcrop;
+uniform vec2 sizeWH;
+uniform vec2 texcropZBuf;
+uniform vec2 screenSize;
+uniform vec2 cameraPlaneShift;
+uniform float cameraHFovDegrees;
+uniform float cameraNearClip;
+uniform float cameraFarClip;
+uniform float screenPlaneDistance;
+
+float linearizeDepth(float depth) {
+	float z = clamp(depth, 0.0, 1.0) * 2.0 - 1.0;
+	float denom = cameraFarClip + cameraNearClip - z * (cameraFarClip - cameraNearClip);
+	if (abs(denom) < 0.0001)
+		return cameraNearClip;
+	return (2.0 * cameraNearClip * cameraFarClip) / denom;
+}
 
 void main() {
-	outColor = texture(tex, Texcoord);
+	vec2 sampleUv = Texcoord;
+
+	if (UBOOL_TEST(useParallax)) {
+		vec2 zCoord = vec2((gl_FragCoord.x - 0.5) / screenSize.x, 1.0 - (gl_FragCoord.y - 0.5) / screenSize.y);
+		vec2 sampled = texture(texZBuf, zCoord * texcropZBuf).ra;
+		// The 16-bit Z value V = H*256+L is reconstructed as V/65280 from
+		// the luminance-alpha texture, but true [0,1] depth is V/65535.
+		// Scale by 256/257 (= 65280/65535) to match gl_FragCoord.z space.
+		// (This is the reciprocal of the 1.0039 bias in the actor depth test.)
+		float sceneZ = (sampled.y + sampled.x / 256.0) * (256.0 / 257.0);
+		float linearDepth = linearizeDepth(sceneZ);
+		float tanHalfFovX = tan(radians(cameraHFovDegrees) * 0.5);
+		float tanHalfFovY = tanHalfFovX * 0.75;
+		vec2 drawSizePixels = max(screenSize * sizeWH, vec2(1.0));
+		float depthFactor = (1.0 / max(screenPlaneDistance, 0.0001)) - (1.0 / max(linearDepth, 0.0001));
+		vec2 screenShiftPixels = vec2(
+			(cameraPlaneShift.x * screenSize.x * 0.5) * depthFactor / max(tanHalfFovX, 0.0001),
+			(cameraPlaneShift.y * screenSize.y * 0.5) * depthFactor / max(tanHalfFovY, 0.0001)
+		);
+		sampleUv = clamp(Texcoord - (screenShiftPixels / drawSizePixels) * texcrop, vec2(0.0), texcrop);
+	}
+
+	outColor = texture(tex, sampleUv);
 }

@@ -31,6 +31,8 @@
 
 #include "graphics/renderer.h"
 
+#include "math/vector2d.h"
+
 #include "engines/grim/textobject.h"
 #include "engines/grim/iris.h"
 #include "engines/grim/detection.h"
@@ -74,16 +76,21 @@ public:
 		VoiceOnly = 2,
 		TextAndVoice = 3
 	};
+	enum ParallaxDebugInputSource {
+		kParallaxDebugInputMouse = 0,
+		kParallaxDebugInputAuto = 1,
+		kParallaxDebugInputOpentrack = 2
+	};
 
 	GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, Common::Platform platform, Common::Language language);
 	virtual ~GrimEngine();
 
 	void clearPools();
 
-	uint32 getGameFlags() { return _gameFlags; }
-	GrimGameType getGameType() { return _gameType; }
-	Common::Language getGameLanguage() { return _gameLanguage; }
-	Common::Platform getGamePlatform() { return _gamePlatform; }
+	uint32 getGameFlags() const { return _gameFlags; }
+	GrimGameType getGameType() const { return _gameType; }
+	Common::Language getGameLanguage() const { return _gameLanguage; }
+	Common::Platform getGamePlatform() const { return _gamePlatform; }
 	virtual const char *getUpdateFilename();
 	bool canLoadGameStateCurrently(Common::U32String *msg = nullptr) override { return true; }
 	Common::Error loadGameState(int slot) override;
@@ -179,6 +186,28 @@ public:
 
 	// TODO: Refactor.
 	void setSaveMetaData(const char*, int, const char*);
+	bool handleParallaxDebugHotkey(const Common::KeyState &key);
+	bool isParallaxDebugHotkey(Common::KeyCode keycode) const;
+	void updateParallaxDebugMouse(int x, int y);
+	void updateParallaxDebugAuto();
+	void updateParallaxDebugOpentrack();
+	bool ensureParallaxDebugOpentrackSocket();
+	void closeParallaxDebugOpentrackSocket();
+	void setParallaxDebugInputSource(ParallaxDebugInputSource source);
+	void resetParallaxDebugInput();
+	Math::Vector3d getParallaxDebugCameraOffset(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) const;
+	Math::Vector2d getParallaxDebugCameraPlaneOffset() const;
+	void getParallaxDebugScreenOffset(float factor, int &x, int &y) const;
+	bool toggleParallaxDebugLog();
+	void closeParallaxDebugLog();
+	void writeParallaxDebugLogFrame();
+	bool isParallaxDebugEnabled() const { return _parallaxDebugEnabled; }
+	bool isParallaxDebugOverlayEnabled() const { return _parallaxDebugOverlayEnabled; }
+	void drawParallaxDebugOverlay();
+	float getParallaxDebugInputX() const { return _parallaxDebugInputX; }
+	float getParallaxDebugInputY() const { return _parallaxDebugInputY; }
+	float getParallaxDebugStrength() const { return _parallaxDebugStrength; }
+	ParallaxDebugInputSource getParallaxDebugInputSource() const { return _parallaxDebugInputSource; }
 
 	void saveGame(const Common::String &file);
 	void loadGame(const Common::String &file);
@@ -261,6 +290,27 @@ protected:
 	float *_joyAxisPosition;
 
 	bool _changeHardwareState = false;
+	bool _parallaxDebugEnabled = false;
+	ParallaxDebugInputSource _parallaxDebugInputSource = kParallaxDebugInputMouse;
+	float _parallaxDebugInputX = 0.0f;
+	float _parallaxDebugInputY = 0.0f;
+	float _parallaxDebugStrength = 0.35f;
+	float _parallaxDebugPhase = 0.0f;
+	int _parallaxDebugOpentrackPort = 4242;
+	float _parallaxDebugOpentrackRangeX = 12.0f;
+	float _parallaxDebugOpentrackRangeY = 8.0f;
+	bool _parallaxDebugOpentrackSocketReady = false;
+	bool _parallaxDebugOpentrackHasPose = false;
+	bool _parallaxDebugOpentrackAnnounced = false;
+	bool _parallaxDebugOverlayEnabled = true;
+	bool _parallaxDebugLogEnabled = false;
+	uint32 _parallaxDebugOpentrackLastPacketMillis = 0;
+	uint32 _parallaxDebugLogFrameCounter = 0;
+	void *_parallaxDebugOpentrackSocket = nullptr;
+	void *_parallaxDebugOpentrackPacket = nullptr;
+	void *_parallaxDebugLogFile = nullptr;
+	double _parallaxDebugOpentrackPose[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+	double _parallaxDebugOpentrackCenter[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 
 	Actor *_selectedActor;
 	Iris *_iris;

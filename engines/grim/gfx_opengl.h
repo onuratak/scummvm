@@ -43,7 +43,7 @@ public:
 
 	const char *getVideoDeviceName() override;
 
-	void setupCameraFrustum(float fov, float nclip, float fclip) override;
+	void setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift, float screenPlaneDistance) override;
 	void positionCamera(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) override;
 	void positionCamera(const Math::Vector3d &pos, const Math::Matrix4 &rot) override;
 

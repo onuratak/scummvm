@@ -56,7 +56,7 @@ public:
 	const Common::String &getBitmapFilename() const;
 
 	void setActiveImage(int val);
-	void draw();
+	void draw(int offsetX = 0, int offsetY = 0);
 
 private:
 	bool _visibility;

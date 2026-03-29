@@ -193,12 +193,19 @@ const char *GfxOpenGL::getVideoDeviceName() {
 	return "OpenGL Renderer";
 }
 
-void GfxOpenGL::setupCameraFrustum(float fov, float nclip, float fclip) {
+void GfxOpenGL::setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift, float screenPlaneDistance) {
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
 
 	float right = nclip * tan(fov / 2 * ((float)M_PI / 180));
-	glFrustum(-right, right, -right * 0.75, right * 0.75, nclip, fclip);
+	float top = right * 0.75f;
+	float shiftX = 0.0f;
+	float shiftY = 0.0f;
+	if (screenPlaneDistance > 0.0001f) {
+		shiftX = -(cameraPlaneShift.getX() * nclip) / screenPlaneDistance;
+		shiftY = -(cameraPlaneShift.getY() * nclip) / screenPlaneDistance;
+	}
+	glFrustum(-right + shiftX, right + shiftX, -top + shiftY, top + shiftY, nclip, fclip);
 
 	glMatrixMode(GL_MODELVIEW);
 	glLoadIdentity();

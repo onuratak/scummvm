@@ -773,8 +773,16 @@ void Set::Setup::setupCamera() const {
 	// zbuffer transformation in bitmap.cpp to take nclip_ and
 	// fclip_ into account.
 	if (g_grim->getGameType() == GType_GRIM) {
-		g_driver->setupCameraFrustum(_fov, 0.01f, 3276.8f);
-		g_driver->positionCamera(_pos, _interest, _roll);
+		Math::Vector3d cameraPos = _pos;
+		Math::Vector3d cameraInterest = _interest;
+		const Math::Vector2d cameraPlaneShift = g_grim->getParallaxDebugCameraPlaneOffset();
+		const Math::Vector3d parallaxOffset = g_grim->getParallaxDebugCameraOffset(_pos, _interest, _roll);
+		const float screenPlaneDistance = MAX((_interest - _pos).getMagnitude(), 0.01f);
+		cameraPos += parallaxOffset;
+		cameraInterest += parallaxOffset;
+
+		g_driver->setupCameraFrustum(_fov, 0.01f, 3276.8f, cameraPlaneShift, screenPlaneDistance);
+		g_driver->positionCamera(cameraPos, cameraInterest, _roll);
 	} else {
 		g_driver->setupCameraFrustum(_fov, _nclip, _fclip);
 		g_driver->positionCamera(_pos, _rot);
@@ -879,22 +887,74 @@ Bitmap::Ptr Set::loadBackground(const char *fileName) {
 }
 
 void Set::drawBackground() const {
+	const bool useDepthAwareBackground = g_grim->isParallaxDebugEnabled() &&
+		g_grim->getGameType() == GType_GRIM &&
+		g_driver->supportsShaders() &&
+		_currSetup->_bkgndBm &&
+		_currSetup->_bkgndZBm;
+
+	int offsetX = 0;
+	int offsetY = 0;
+	if (!useDepthAwareBackground)
+		g_grim->getParallaxDebugScreenOffset(0.70f, offsetX, offsetY);
+
 	if (_currSetup->_bkgndZBm) // Some screens have no zbuffer mask (eg, Alley)
-		_currSetup->_bkgndZBm->draw();
+		_currSetup->_bkgndZBm->draw(_currSetup->_bkgndZBm->getBitmapData()->_x + offsetX,
+		                            _currSetup->_bkgndZBm->getBitmapData()->_y + offsetY);
 
 	if (!_currSetup->_bkgndBm) {
 		// This should fail softly, for some reason jumping to the signpost (sg) will load
 		// the scene in such a way that the background isn't immediately available
 		warning("Background hasn't loaded yet for setup %s in %s!", _currSetup->_name.c_str(), _name.c_str());
 	} else {
-		_currSetup->_bkgndBm->draw();
+		const int drawX = _currSetup->_bkgndBm->getBitmapData()->_x + offsetX;
+		const int drawY = _currSetup->_bkgndBm->getBitmapData()->_y + offsetY;
+
+		if (useDepthAwareBackground) {
+			const Math::Vector2d cameraPlaneShift = g_grim->getParallaxDebugCameraPlaneOffset();
+			const float screenPlaneDistance = MAX((_currSetup->_interest - _currSetup->_pos).getMagnitude(), 0.01f);
+			g_driver->drawDepthAwareBackground(_currSetup->_bkgndBm, drawX, drawY, cameraPlaneShift, _currSetup->_fov, 0.01f, 3276.8f, screenPlaneDistance);
+		} else {
+			_currSetup->_bkgndBm->draw(drawX, drawY);
+		}
 	}
 }
 
 void Set::drawBitmaps(ObjectState::Position stage) {
+	int offsetX = 0;
+	int offsetY = 0;
+	const bool useDepthAwareBackground = g_grim->isParallaxDebugEnabled() &&
+		g_grim->getGameType() == GType_GRIM &&
+		g_driver->supportsShaders() &&
+		_currSetup->_bkgndBm &&
+		_currSetup->_bkgndZBm;
+
+	// The main backdrop is already being depth-warped in the shader path. Applying
+	// heuristic screen-space shifts to the auxiliary bitmap layers causes visible
+	// seams where those layers no longer line up with the warped room image.
+	if (!useDepthAwareBackground) {
+		float parallaxFactor = 0.0f;
+		switch (stage) {
+		case ObjectState::OBJSTATE_BACKGROUND:
+			parallaxFactor = 0.80f;
+			break;
+		case ObjectState::OBJSTATE_STATE:
+			parallaxFactor = 0.90f;
+			break;
+		case ObjectState::OBJSTATE_UNDERLAY:
+			parallaxFactor = 1.00f;
+			break;
+		case ObjectState::OBJSTATE_OVERLAY:
+			parallaxFactor = 1.10f;
+			break;
+		}
+
+		g_grim->getParallaxDebugScreenOffset(parallaxFactor, offsetX, offsetY);
+	}
+
 	for (StateList::iterator i = _states.reverse_begin(); i != _states.end(); --i) {
 		if ((*i)->getPos() == stage && _currSetup == _setups + (*i)->getSetupID())
-			(*i)->draw();
+			(*i)->draw(offsetX, offsetY);
 	}
 }
 

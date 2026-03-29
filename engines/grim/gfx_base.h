@@ -22,6 +22,7 @@
 #ifndef GRIM_GFX_BASE_H
 #define GRIM_GFX_BASE_H
 
+#include "math/vector2d.h"
 #include "math/vector3d.h"
 #include "math/quat.h"
 
@@ -88,7 +89,7 @@ public:
 	virtual uint getScreenWidth() { return _screenWidth; }
 	virtual uint getScreenHeight() { return _screenHeight; }
 
-	virtual void setupCameraFrustum(float fov, float nclip, float fclip) = 0;
+	virtual void setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift = Math::Vector2d(), float screenPlaneDistance = 0.0f) = 0;
 	virtual void positionCamera(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) = 0;
 	virtual void positionCamera(const Math::Vector3d &pos, const Math::Matrix4 &rot) = 0;
 
@@ -171,6 +172,9 @@ public:
 	 * @see destroyBitmap
 	 */
 	virtual void drawBitmap(const Bitmap *bitmap, int x, int y, uint32 layer = 0) = 0;
+	virtual void drawDepthAwareBackground(const Bitmap *bitmap, int x, int y, const Math::Vector2d &cameraPlaneShift, float horizontalFovDegrees, float nearClip, float farClip, float screenPlaneDistance) {
+		drawBitmap(bitmap, x, y);
+	}
 
 	/**
 	 * Deletes any internal references and representations of a bitmap

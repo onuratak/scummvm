@@ -203,6 +203,8 @@ GfxOpenGLS::GfxOpenGLS() {
 	_fov = -1.0;
 	_nclip = -1;
 	_fclip = -1;
+	_frustumOffset = Math::Vector2d(1e9f, 1e9f);
+	_screenPlaneDistance = -1.0f;
 	_selectedTexture = nullptr;
 	_emergTexture = 0;
 	_maxLights = 8;
@@ -423,16 +425,29 @@ void GfxOpenGLS::setupScreen(int screenW, int screenH) {
 	}
 }
 
-void GfxOpenGLS::setupCameraFrustum(float fov, float nclip, float fclip) {
-	if (_fov == fov && _nclip == nclip && _fclip == fclip)
+void GfxOpenGLS::setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift, float screenPlaneDistance) {
+	if (_fov == fov && _nclip == nclip && _fclip == fclip &&
+		_frustumOffset.getX() == cameraPlaneShift.getX() &&
+		_frustumOffset.getY() == cameraPlaneShift.getY() &&
+		_screenPlaneDistance == screenPlaneDistance)
 		return;
 
-	_fov = fov; _nclip = nclip; _fclip = fclip;
+	_fov = fov;
+	_nclip = nclip;
+	_fclip = fclip;
+	_frustumOffset = cameraPlaneShift;
+	_screenPlaneDistance = screenPlaneDistance;
 
 	float right = nclip * tan(fov / 2 * ((float)M_PI / 180));
-	float top = right * 0.75;
+	float top = right * 0.75f;
+	float shiftX = 0.0f;
+	float shiftY = 0.0f;
+	if (screenPlaneDistance > 0.0001f) {
+		shiftX = -(cameraPlaneShift.getX() * nclip) / screenPlaneDistance;
+		shiftY = -(cameraPlaneShift.getY() * nclip) / screenPlaneDistance;
+	}
 
-	_projMatrix = makeFrustumMatrix(-right, right, -top, top, nclip, fclip);
+	_projMatrix = makeFrustumMatrix(-right + shiftX, right + shiftX, -top + shiftY, top + shiftY, nclip, fclip);
 }
 
 void GfxOpenGLS::positionCamera(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) {
@@ -1476,6 +1491,9 @@ void GfxOpenGLS::drawBitmap(const Bitmap *bitmap, int dx, int dy, uint32 layer) 
 		glBindTexture(GL_TEXTURE_2D, textures[cur_tex_idx]);
 		float width = bitmap->getWidth();
 		float height = bitmap->getHeight();
+		shader->setUniform("tex", 0);
+		if (g_grim->getGameType() == GType_GRIM)
+			shader->setUniform("useParallax", GL_FALSE);
 		shader->setUniform("offsetXY", Math::Vector2d(float(dx) / _gameWidth, float(dy) / _gameHeight));
 		shader->setUniform("sizeWH", Math::Vector2d(width / _gameWidth, height / _gameHeight));
 		shader->setUniform("texcrop", Math::Vector2d(width / nextHigher2((int)width), height / nextHigher2((int)height)));
@@ -1494,6 +1512,58 @@ void GfxOpenGLS::drawBitmap(const Bitmap *bitmap, int dx, int dy, uint32 layer) 
 		}
 		return;
 	}
+}
+
+void GfxOpenGLS::drawDepthAwareBackground(const Bitmap *bitmap, int dx, int dy, const Math::Vector2d &cameraPlaneShift, float horizontalFovDegrees, float nearClip, float farClip, float screenPlaneDistance) {
+	if (!bitmap || g_grim->getGameType() != GType_GRIM || bitmap->getFormat() != 1) {
+		drawBitmap(bitmap, dx, dy);
+		return;
+	}
+
+	GLuint *textures = (GLuint *)bitmap->getTexIds();
+	if (bitmap->getHasTransparency()) {
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	} else {
+		glDisable(GL_BLEND);
+	}
+
+	OpenGL::Shader *shader = (OpenGL::Shader *)bitmap->_data->_userData;
+	shader->use();
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _quadEBO);
+	int curTexIndex = bitmap->getNumTex() * (bitmap->getActiveImage() - 1);
+	glBindTexture(GL_TEXTURE_2D, textures[curTexIndex]);
+
+	// Ensure z-buffer texture is bound on unit 1 (normally left bound by
+	// the preceding drawDepthBitmap call, but bind explicitly for safety).
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, _zBufTex);
+	glActiveTexture(GL_TEXTURE0);
+
+	const float width = bitmap->getWidth();
+	const float height = bitmap->getHeight();
+	shader->setUniform("tex", 0);
+	shader->setUniform("texZBuf", 1);
+	shader->setUniform("useParallax", GL_TRUE);
+	shader->setUniform("offsetXY", Math::Vector2d(float(dx) / _gameWidth, float(dy) / _gameHeight));
+	shader->setUniform("sizeWH", Math::Vector2d(width / _gameWidth, height / _gameHeight));
+	shader->setUniform("texcrop", Math::Vector2d(width / nextHigher2((int)width), height / nextHigher2((int)height)));
+	shader->setUniform("texcropZBuf", _zBufTexCrop);
+	shader->setUniform("screenSize", Math::Vector2d(_screenWidth, _screenHeight));
+	shader->setUniform("cameraPlaneShift", cameraPlaneShift);
+	shader->setUniform1f("cameraHFovDegrees", horizontalFovDegrees);
+	shader->setUniform1f("cameraNearClip", nearClip);
+	shader->setUniform1f("cameraFarClip", farClip);
+	shader->setUniform1f("screenPlaneDistance", screenPlaneDistance);
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+
+	shader->setUniform("useParallax", GL_FALSE);
+	glDisable(GL_BLEND);
+	glDepthMask(GL_TRUE);
+	glEnable(GL_DEPTH_TEST);
 }
 
 void GfxOpenGLS::drawDepthBitmap(int bitmapId, int x, int y, int w, int h, char *data) {

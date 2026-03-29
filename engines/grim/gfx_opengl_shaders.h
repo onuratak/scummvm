@@ -52,7 +52,7 @@ public:
 	 */
 	bool isHardwareAccelerated() override { return true; };
 	bool supportsShaders() override { return true; }
-	void setupCameraFrustum(float fov, float nclip, float fclip) override;
+	void setupCameraFrustum(float fov, float nclip, float fclip, const Math::Vector2d &cameraPlaneShift, float screenPlaneDistance) override;
 	void positionCamera(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) override;
 	void positionCamera(const Math::Vector3d &pos, const Math::Matrix4 &rot) override;
 
@@ -128,6 +128,7 @@ public:
 	 * @see destroyBitmap
 	 */
 	void drawBitmap(const Bitmap *bitmap, int x, int y, uint32 layer = 0) override;
+	void drawDepthAwareBackground(const Bitmap *bitmap, int x, int y, const Math::Vector2d &cameraPlaneShift, float horizontalFovDegrees, float nearClip, float farClip, float screenPlaneDistance) override;
 
 	/**
 	 * Deletes any internal references and representations of a bitmap
@@ -251,6 +252,8 @@ private:
 	float _fov;
 	float _nclip;
 	float _fclip;
+	Math::Vector2d _frustumOffset;
+	float _screenPlaneDistance;
 	Math::Matrix4 _projMatrix;
 	Math::Matrix4 _viewMatrix;
 	Math::Matrix4 _mvpMatrix;

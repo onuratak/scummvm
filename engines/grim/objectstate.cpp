@@ -60,16 +60,16 @@ void ObjectState::setActiveImage(int val) {
 	_visibility = val != 0;
 }
 
-void ObjectState::draw() {
+void ObjectState::draw(int offsetX, int offsetY) {
 	if (!_visibility)
 		return;
 
 	assert(_bitmap);
-	_bitmap->draw();
+	_bitmap->draw(_bitmap->getBitmapData()->_x + offsetX, _bitmap->getBitmapData()->_y + offsetY);
 	// The only OBJSTATE_UNDERLAY which has a zbuffer is the bonewagon in set bv. Original doesn't draw that zbuffer,
 	// so we don't either, otherwise this bug will appear: https://github.com/residualvm/residualvm/issues/143
 	if (_zbitmap && _pos != OBJSTATE_UNDERLAY)
-		_zbitmap->draw();
+		_zbitmap->draw(_zbitmap->getBitmapData()->_x + offsetX, _zbitmap->getBitmapData()->_y + offsetY);
 }
 
 void ObjectState::saveState(SaveGame *savedState) const {

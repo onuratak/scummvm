@@ -2,6 +2,10 @@
 
 This note is the high-level design starting point for the Monkey Island parallax / pseudo-3D idea.
 
+Current Grim Fandango Windows prototype handoff:
+
+- `agent-docs/grim-parallax-handoff.md`
+
 ## Scope
 
 Target games:
