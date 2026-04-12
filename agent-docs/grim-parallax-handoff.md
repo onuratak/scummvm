@@ -4,11 +4,40 @@ This note is the current handoff for the Grim Fandango parallax prototype on Win
 
 Use this before doing more work in Grim. The long-term target is still Monkey Island 1-3 in SCUMM, but the current prototype remains Grim-only because Grim already has a true 3D camera, mixed 2D/3D scene composition, and scene z-bitmaps that make desktop parallax experiments practical.
 
+## Latest session status
+
+The latest session added a second render path for comparison:
+
+- `warp`: the existing shader-based depth reprojection path
+- `layered`: a new manifest + PNG plate compositor intended to test broad depth-band layering
+
+Current end-of-session status:
+
+- Layered mode can now be selected at runtime with `F12`.
+- Runtime telemetry was extended so `F10` CSV captures and the `F11` overlay report whether layered assets were actually loaded or whether the room fell back to the static bitmap.
+- The generated plate assets live in `C:\Users\onur_\Downloads\Grim Fandango\parallax_layers`.
+- The active Grim target path in ScummVM is `C:\Users\onur_\Downloads\Grim Fandango\GRIMDATA\`.
+- Because the engine target path points at `GRIMDATA`, the live test only started finding layered assets after creating a filesystem junction:
+  - `C:\Users\onur_\Downloads\Grim Fandango\GRIMDATA\parallax_layers`
+  - pointing to
+  - `C:\Users\onur_\Downloads\Grim Fandango\parallax_layers`
+
+Important current blocker:
+
+- Layered mode now loads, but the room backdrops render almost black while characters and some objects remain visible.
+- That means the current blocker is no longer path discovery.
+- The next debugging target is plate/image decode or color/alpha handling for the loaded PNG-backed `Bitmap` objects.
+
 ## Current goal
 
 Validate a convincing fixed-monitor look-around effect on Windows, using external head tracking, before carrying the ideas into Monkey Island.
 
-The current question is no longer "can things move?" The prototype now moves the 3D scene and backdrop together. The question is how to reduce reprojection artifacts enough to make the effect useful and transferable.
+The current question is no longer just "can things move?" There are now two experimental backdrop strategies:
+
+- shader depth warp
+- layered broad-band backdrop plates
+
+The immediate question is which path has the better ceiling for a usable desktop parallax effect, and what the real failure mode is for each path.
 
 ## Current implementation state
 
@@ -40,6 +69,7 @@ What exists now:
 - Off-axis frustum support in Grim renderers.
 - Camera-space translation derived from normalized parallax input.
 - Depth-aware background reprojection in the OpenGL shader renderer using the Grim backdrop z-bitmap.
+- Layered backdrop compositor that loads `manifest.json` plus PNG plates from disk.
 - CSV logging pipeline for per-frame telemetry.
 - Independent debug overlay toggle.
 
@@ -48,6 +78,14 @@ What changed recently and matters:
 - The biggest activation bug is fixed: when parallax is toggled with `F6`, the renderer is recreated so Grim can switch into the shader renderer path at runtime.
 - The shader backdrop path is now confirmed active in live captures.
 - Auxiliary `ObjectState` bitmap layers are no longer shifted heuristically while the shader-backed depth-aware background path is active. That reduced obvious seam drift between warped backdrop pixels and separately shifted room layers.
+- The layered path now has explicit runtime status reporting in both the overlay and CSV.
+- The first major layered-mode discovery bug was naming/path related:
+  - Grim setup names in live rooms look like `mo_ddtws`
+  - generated asset folders were named like `mo_0_ddtws`
+  - the live target path points to `...\GRIMDATA\`
+  - the generated assets were emitted to a sibling `...\parallax_layers\`
+- The current working filesystem setup that made layered mode discoverable is the `GRIMDATA\parallax_layers` junction described above.
+- After discovery was fixed, the loaded layered plates rendered almost black. That is the current blocker.
 
 ## Current debug controls
 
@@ -57,6 +95,7 @@ What changed recently and matters:
 - `F9`: toggle mouse / `opentrack`
 - `F10`: toggle CSV logging
 - `F11`: toggle on-screen debug overlay
+- `F12`: toggle render mode between `warp` and `layered`
 - `[` / `]`: decrease / increase strength
 - Mouse move inside the game window: drive input in mouse mode
 
@@ -123,7 +162,7 @@ Most recent CSV reviewed:
 
 - `build/msvc-vs2022/Releasex64/grim_parallax_debug.csv`
 
-Most recent capture summary:
+Most recent shader capture summary:
 
 - `204` frames
 - `input_source = opentrack`
@@ -135,6 +174,20 @@ Most recent capture summary:
 - `bg_shift_far_x` reaches about `+/-5.42` px
 
 That confirms the shader path is now live and depth-dependent motion is occurring.
+
+Most recent layered capture summary:
+
+- `render_mode = layered`
+- `setup_name = mo_ddtws`
+- initial failure mode was:
+  - `layered_requested = 1`
+  - `layered_loaded = 0`
+  - `layered_fallback_static = 1`
+  - `layered_status = not_found`
+- after the `GRIMDATA\parallax_layers` junction was added, layered mode stopped being a pure discovery failure and started drawing loaded content
+- current visible result is almost-black room plates with characters still visible on top
+
+That means the next session should not spend time rediscovering the asset location problem unless the junction disappears.
 
 ## What is still broken
 
@@ -165,6 +218,17 @@ Main remaining issues:
    - The `layer_*` and some fallback offset columns are still logged from helper math even when those offsets are not applied because the shader path is active.
    - The log is useful, but not every field reflects the exact active draw path anymore.
 
+6. Layered backdrop mode currently renders almost-black room plates
+   - This is the newest blocker.
+   - The room is being discovered and loaded, but the loaded plate images render nearly black.
+   - Characters and some scene objects still appear, which suggests the problem is in the plate image path rather than the full scene render path.
+   - Most likely areas:
+     - PNG decode into `Graphics::Surface`
+     - `Bitmap` construction for PNG-backed images
+     - pixel format / channel ordering
+     - alpha handling causing the room to multiply/blend against black
+     - draw path differences between native Grim bitmaps and PNG-backed bitmaps
+
 ## Likely root cause of the visible artifacts
 
 The current artifacts are not caused by "defragmentation" or by the UDP/head-tracking path.
@@ -176,6 +240,12 @@ They come mainly from the rendering approach:
 - using only a z-buffer and no hidden color data behind occluders
 
 This is fundamentally an image-warping technique, not a full scene re-render of the background. It can look convincing at small motion, but it will always expose cracks at strong depth transitions unless the content is expanded, layered more intelligently, or regenerated.
+
+The layered path has a different current failure mode:
+
+- the assets are no longer merely missing
+- the loaded room plates appear too dark / almost black
+- that points to image ingest / compositing correctness, not to the conceptual viability of layered parallax itself
 
 ## Current math path
 
@@ -211,6 +281,8 @@ Useful files:
 - `engines/grim/set.cpp`
   - `Set::Setup::setupCamera()`
   - `Set::drawBackground()`
+  - layered manifest/PNG loading
+  - layered manifest candidate search
   - `Set::drawBitmaps()`
 
 - `engines/grim/gfx_opengl.cpp`
@@ -222,6 +294,13 @@ Useful files:
 
 - `engines/grim/shaders/grim_background.fragment`
   - current reprojection logic
+
+- `engines/grim/bitmap.cpp`
+  - PNG-backed `Bitmap` transparency / surface ingestion path
+
+- `devtools/grim_parallax_layer_suggest.py`
+  - emits broad-band runtime layered assets
+  - current output naming uses bitmap stems such as `mo_0_ddtws`
 
 - `graphics/parallax.h`
   - shared math helpers intended to be reusable for later SCUMM work
@@ -252,26 +331,31 @@ Right now the first two are much improved. The main remaining failures are in th
 
 Do not spend the next round redoing tracker input or basic frustum math.
 
-The next useful work is artifact reduction in the backdrop reprojection path.
+The next useful work is now split by render mode:
+
+- for `warp`: artifact reduction in the shader reprojection path
+- for `layered`: fix the almost-black plate rendering first, before judging the visual quality of the layered approach
 
 Recommended order:
 
-1. Improve the documentation/debug truthfulness
-   - Make CSV fields clearly distinguish actual applied offsets from theoretical helper values.
-   - Validate or replace the actor screen-bbox telemetry.
+1. Fix layered plate rendering correctness
+   - Verify the loaded `manifest.json`, `base_plate.png`, and `overlay_*.png` images visually in code, not just by existence.
+   - Inspect the PNG-backed `Bitmap` path and compare it against native Grim backdrop bitmap creation.
+   - Determine whether the black result is caused by wrong RGB ordering, premultiplied alpha assumptions, or draw/blend state.
 
-2. Reduce reprojection artifacts near depth discontinuities
-   - Inspect local depth gradients in the background shader.
-   - Suppress or soften reprojection where neighboring depth changes sharply.
-   - This will trade some depth strength for fewer cracks and jagged seams.
+2. Keep the runtime asset discovery story simple
+   - The current live test depends on:
+     - `C:\Users\onur_\Downloads\Grim Fandango\parallax_layers`
+     - plus the `GRIMDATA\parallax_layers` junction
+   - Do not rip that out until the layered renderer is visually correct.
 
-3. Handle border reveal more gracefully
-   - Explore mild overscan, edge dilation, or conservative clamp behavior.
-   - Do not try to solve missing image content perfectly in-engine on the next pass.
+3. Once layered plates render correctly, compare `warp` vs `layered`
+   - Then decide whether layered broad-band plates are worth further investment.
+   - Only after the visuals are trustworthy should quality comparisons be made.
 
-4. Only after that, revisit room-layer treatment
-   - Some scenes may still need a better policy for auxiliary `ObjectState` layers.
-   - But the immediate problem is the main backdrop warp quality, not the tracker.
+4. If layered remains promising, then continue with shader artifact work or layered tuning as needed
+   - For `warp`, reduce cracks and border artifacts.
+   - For `layered`, tune plate factors and layer definitions.
 
 ## Non-goals for the next agent
 
@@ -280,13 +364,14 @@ Recommended order:
 - Do not go back to moving the OS window as the control model.
 - Do not assume the actor bbox telemetry is trustworthy until verified.
 - Do not interpret the current border gaps as proof the effect is mathematically wrong.
+- Do not waste time re-debugging the original `not_found` symptom if the `GRIMDATA\parallax_layers` junction is still present.
 
 ## Deliverable expected from the next agent
 
 The next valuable deliverable is:
 
-- a cleaner depth-aware background shader with fewer cracks and edge artifacts
-- better telemetry that reflects the actual active render path
-- a short validation note on whether small-motion desktop parallax is now visually acceptable in Grim
+- a correct-looking layered backdrop draw path
+- or a clear technical reason why the current PNG/manifest plate approach is not worth continuing
+- plus updated notes comparing `warp` and `layered` once both are visually truthful
 
 If that becomes stable enough, then the project can decide which pieces are actually worth carrying into SCUMM for Monkey Island.

@@ -533,8 +533,8 @@ void GfxOpenGL::getActorScreenBBox(const Actor *actor, Common::Point &p1, Common
 
 	// Swap the p1/p2 y coorindates
 	int16 tmp = p1.y;
-	p1.y = 480 - p2.y;
-	p2.y = 480 - tmp;
+	p1.y = _gameHeight - p2.y;
+	p2.y = _gameHeight - tmp;
 
 	// Restore the state
 	glPopMatrix();
@@ -1126,6 +1126,16 @@ void GfxOpenGL::createBitmap(BitmapData *bitmap) {
 				texOut = (byte *)const_cast<void *>(imageData.getPixels());
 			} else {
 				texOut = (byte *)const_cast<void *>(imageData.getPixels());
+			}
+
+			if (bitmap->_format == 1 && bitmap->getImageData(pic).format.aBits() > 0) {
+				const byte *alphaScan = texOut + 3;
+				for (int i = 0; i < bitmap->_width * bitmap->_height; ++i, alphaScan += 4) {
+					if (*alphaScan != 0xFF) {
+						bitmap->_hasTransparency = true;
+						break;
+					}
+				}
 			}
 
 			for (int i = 0; i < bitmap->_numTex; i++) {

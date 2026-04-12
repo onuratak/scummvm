@@ -456,8 +456,8 @@ void GfxTinyGL::getActorScreenBBox(const Actor *actor, Common::Point &p1, Common
 
 	// Swap the p1/p2 y coorindates
 	int16 tmp = p1.y;
-	p1.y = 480 - p2.y;
-	p2.y = 480 - tmp;
+	p1.y = _gameHeight - p2.y;
+	p2.y = _gameHeight - tmp;
 
 	// Restore the state
 	tglPopMatrix();

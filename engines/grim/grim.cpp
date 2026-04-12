@@ -114,6 +114,16 @@ static const char *parallaxDebugInputSourceConfigValue(GrimEngine::ParallaxDebug
 	}
 }
 
+static const char *parallaxDebugRenderModeConfigValue(GrimEngine::ParallaxDebugRenderMode mode) {
+	switch (mode) {
+	case GrimEngine::kParallaxDebugRenderLayered:
+		return "layered";
+	case GrimEngine::kParallaxDebugRenderWarp:
+	default:
+		return "warp";
+	}
+}
+
 static bool parallaxDebugPoseIsFinite(const double *pose) {
 	for (int i = 0; i < kParallaxDebugOpentrackAxes; ++i) {
 		if (!std::isfinite(pose[i]))
@@ -121,6 +131,32 @@ static bool parallaxDebugPoseIsFinite(const double *pose) {
 	}
 
 	return true;
+}
+
+static bool parallaxDebugIsUsableActorBBox(const Common::Point &p1, const Common::Point &p2, int screenWidth, int screenHeight) {
+	if (p1.x > p2.x || p1.y > p2.y)
+		return false;
+
+	const int maxAbsX = MAX(screenWidth * 8, 4096);
+	const int maxAbsY = MAX(screenHeight * 8, 4096);
+	return std::abs(p1.x) <= maxAbsX &&
+		std::abs(p1.y) <= maxAbsY &&
+		std::abs(p2.x) <= maxAbsX &&
+		std::abs(p2.y) <= maxAbsY;
+}
+
+static Common::String parallaxDebugSanitizeCsvField(const Common::String &value) {
+	Common::String sanitized;
+
+	for (uint i = 0; i < value.size(); ++i) {
+		const char c = value[i];
+		if (c == ',' || c == '\n' || c == '\r')
+			sanitized += ';';
+		else
+			sanitized += c;
+	}
+
+	return sanitized;
 }
 
 GrimEngine *g_grim = nullptr;
@@ -157,6 +193,7 @@ GrimEngine::GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, C
 	ConfMan.registerDefault("grim_parallax_test_opentrack_range_x", "12.0");
 	ConfMan.registerDefault("grim_parallax_test_opentrack_range_y", "8.0");
 	ConfMan.registerDefault("grim_parallax_test_overlay", true);
+	ConfMan.registerDefault("grim_parallax_test_mode", "warp");
 
 	_showFps = ConfMan.getBool("show_fps");
 	_parallaxDebugEnabled = (getGameType() == GType_GRIM) && ConfMan.getBool("grim_parallax_test");
@@ -165,6 +202,8 @@ GrimEngine::GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, C
 	_parallaxDebugOpentrackRangeX = MAX(0.1f, ConfMan.getFloat("grim_parallax_test_opentrack_range_x"));
 	_parallaxDebugOpentrackRangeY = MAX(0.1f, ConfMan.getFloat("grim_parallax_test_opentrack_range_y"));
 	_parallaxDebugOverlayEnabled = ConfMan.getBool("grim_parallax_test_overlay");
+	_parallaxDebugRenderMode = ConfMan.get("grim_parallax_test_mode").equalsIgnoreCase("layered") ?
+		kParallaxDebugRenderLayered : kParallaxDebugRenderWarp;
 
 	Common::String parallaxSource = ConfMan.get("grim_parallax_test_source");
 	if (parallaxSource.equalsIgnoreCase("opentrack")) {
@@ -1828,6 +1867,7 @@ bool GrimEngine::isParallaxDebugHotkey(Common::KeyCode keycode) const {
 	case Common::KEYCODE_F9:
 	case Common::KEYCODE_F10:
 	case Common::KEYCODE_F11:
+	case Common::KEYCODE_F12:
 	case Common::KEYCODE_LEFTBRACKET:
 	case Common::KEYCODE_RIGHTBRACKET:
 		return true;
@@ -1874,6 +1914,11 @@ void GrimEngine::setParallaxDebugInputSource(ParallaxDebugInputSource source) {
 		g_system->displayMessageOnOSD(Common::U32String::format("Grim parallax opentrack active on UDP %d. F8 recenter, F9 mouse.", _parallaxDebugOpentrackPort));
 		break;
 	}
+}
+
+void GrimEngine::setParallaxDebugRenderMode(ParallaxDebugRenderMode mode) {
+	_parallaxDebugRenderMode = mode;
+	ConfMan.set("grim_parallax_test_mode", parallaxDebugRenderModeConfigValue(mode));
 }
 
 bool GrimEngine::ensureParallaxDebugOpentrackSocket() {
@@ -1937,11 +1982,17 @@ bool GrimEngine::toggleParallaxDebugLog() {
 		"camera_pos_final_x,camera_pos_final_y,camera_pos_final_z,camera_interest_final_x,camera_interest_final_y,camera_interest_final_z,"
 		"camera_offset_x,camera_offset_y,camera_offset_z,fov,roll,screen_plane_distance,"
 		"frustum_shift_near_x,frustum_shift_near_y,frustum_left,frustum_right,frustum_bottom,frustum_top,"
-		"depth_aware_background_active,bg_shift_near_x,bg_shift_near_y,bg_shift_zero_x,bg_shift_zero_y,bg_shift_far_x,bg_shift_far_y,bg_offset_x,bg_offset_y,"
-		"layer_bg_x,layer_bg_y,layer_state_x,layer_state_y,layer_under_x,layer_under_y,layer_over_x,layer_over_y,"
-		"tracked_actor_name,tracked_actor_x1,tracked_actor_y1,tracked_actor_x2,tracked_actor_y2,"
+		"depth_aware_background_active,bg_shift_near_x,bg_shift_near_y,bg_shift_zero_x,bg_shift_zero_y,bg_shift_far_x,bg_shift_far_y,"
+		"bg_offset_applied_x,bg_offset_applied_y,bg_offset_theoretical_x,bg_offset_theoretical_y,"
+		"layer_bg_applied_x,layer_bg_applied_y,layer_bg_theoretical_x,layer_bg_theoretical_y,"
+		"layer_state_applied_x,layer_state_applied_y,layer_state_theoretical_x,layer_state_theoretical_y,"
+		"layer_under_applied_x,layer_under_applied_y,layer_under_theoretical_x,layer_under_theoretical_y,"
+		"layer_over_applied_x,layer_over_applied_y,layer_over_theoretical_x,layer_over_theoretical_y,"
+		"tracked_actor_name,tracked_actor_bbox_valid,tracked_actor_x1,tracked_actor_y1,tracked_actor_x2,tracked_actor_y2,"
 		"opentrack_x,opentrack_y,opentrack_z,opentrack_yaw,opentrack_pitch,opentrack_roll,"
-		"opentrack_center_x,opentrack_center_y,opentrack_center_z,set_name,setup_name\n";
+		"opentrack_center_x,opentrack_center_y,opentrack_center_z,set_name,setup_name,render_mode,"
+		"layered_requested,layered_loaded,layered_fallback_static,layered_status,layered_manifest_path,"
+		"layered_base_factor,layered_base_offset_x,layered_base_offset_y,layered_layer_count,layered_layer_summary\n";
 	logFile->write(header, (uint32)strlen(header));
 	logFile->flush();
 
@@ -1961,6 +2012,22 @@ void GrimEngine::closeParallaxDebugLog() {
 
 	_parallaxDebugLogFile = nullptr;
 	_parallaxDebugLogEnabled = false;
+}
+
+void GrimEngine::updateParallaxDebugLayeredFrameState(const Common::String &setupName, bool requested, bool loaded, bool fallbackToStatic,
+		const Common::String &status, const Common::String &manifestPath, float baseFactor, int baseOffsetX, int baseOffsetY,
+		int layerCount, const Common::String &layerSummary) {
+	_parallaxDebugLayeredSetupName = setupName;
+	_parallaxDebugLayeredRequested = requested;
+	_parallaxDebugLayeredLoaded = loaded;
+	_parallaxDebugLayeredFallbackToStatic = fallbackToStatic;
+	_parallaxDebugLayeredStatus = status;
+	_parallaxDebugLayeredManifestPath = manifestPath;
+	_parallaxDebugLayeredBaseFactor = baseFactor;
+	_parallaxDebugLayeredBaseOffsetX = baseOffsetX;
+	_parallaxDebugLayeredBaseOffsetY = baseOffsetY;
+	_parallaxDebugLayeredLayerCount = layerCount;
+	_parallaxDebugLayeredLayerSummary = layerSummary;
 }
 
 void GrimEngine::writeParallaxDebugLogFrame() {
@@ -2004,6 +2071,8 @@ void GrimEngine::writeParallaxDebugLogFrame() {
 	if (currSet)
 		setName = currSet->getName();
 
+	const char *renderModeName = _parallaxDebugRenderMode == kParallaxDebugRenderLayered ? "layered" : "warp";
+
 	const float nearClip = 0.01f;
 	const float frustumHalfWidth = nearClip * tanf((fov * ((float)M_PI / 180.0f)) * 0.5f);
 	const float frustumHalfHeight = frustumHalfWidth * 0.75f;
@@ -2017,6 +2086,7 @@ void GrimEngine::writeParallaxDebugLogFrame() {
 	const bool depthAwareBackgroundActive =
 		_parallaxDebugEnabled &&
 		getGameType() == GType_GRIM &&
+		_parallaxDebugRenderMode == kParallaxDebugRenderWarp &&
 		g_driver->supportsShaders() &&
 		setup &&
 		setup->_bkgndBm &&
@@ -2040,20 +2110,32 @@ void GrimEngine::writeParallaxDebugLogFrame() {
 		bgShiftFar = Graphics::Parallax::computePerspectivePixelShift(planeShift, screenPlaneDistance * 2.0f, perspectiveConfig);
 	}
 
-	int bgOffX = 0, bgOffY = 0;
-	int layerBgX = 0, layerBgY = 0;
-	int layerStateX = 0, layerStateY = 0;
-	int layerUnderX = 0, layerUnderY = 0;
-	int layerOverX = 0, layerOverY = 0;
-	getParallaxDebugScreenOffset(0.70f, bgOffX, bgOffY);
-	getParallaxDebugScreenOffset(0.80f, layerBgX, layerBgY);
-	getParallaxDebugScreenOffset(0.90f, layerStateX, layerStateY);
-	getParallaxDebugScreenOffset(1.00f, layerUnderX, layerUnderY);
-	getParallaxDebugScreenOffset(1.10f, layerOverX, layerOverY);
+	int bgOffTheoreticalX = 0, bgOffTheoreticalY = 0;
+	int layerBgTheoreticalX = 0, layerBgTheoreticalY = 0;
+	int layerStateTheoreticalX = 0, layerStateTheoreticalY = 0;
+	int layerUnderTheoreticalX = 0, layerUnderTheoreticalY = 0;
+	int layerOverTheoreticalX = 0, layerOverTheoreticalY = 0;
+	getParallaxDebugScreenOffset(0.70f, bgOffTheoreticalX, bgOffTheoreticalY);
+	getParallaxDebugScreenOffset(0.80f, layerBgTheoreticalX, layerBgTheoreticalY);
+	getParallaxDebugScreenOffset(0.90f, layerStateTheoreticalX, layerStateTheoreticalY);
+	getParallaxDebugScreenOffset(1.00f, layerUnderTheoreticalX, layerUnderTheoreticalY);
+	getParallaxDebugScreenOffset(1.10f, layerOverTheoreticalX, layerOverTheoreticalY);
+
+	const int bgOffAppliedX = depthAwareBackgroundActive ? 0 : bgOffTheoreticalX;
+	const int bgOffAppliedY = depthAwareBackgroundActive ? 0 : bgOffTheoreticalY;
+	const int layerBgAppliedX = depthAwareBackgroundActive ? 0 : layerBgTheoreticalX;
+	const int layerBgAppliedY = depthAwareBackgroundActive ? 0 : layerBgTheoreticalY;
+	const int layerStateAppliedX = depthAwareBackgroundActive ? 0 : layerStateTheoreticalX;
+	const int layerStateAppliedY = depthAwareBackgroundActive ? 0 : layerStateTheoreticalY;
+	const int layerUnderAppliedX = depthAwareBackgroundActive ? 0 : layerUnderTheoreticalX;
+	const int layerUnderAppliedY = depthAwareBackgroundActive ? 0 : layerUnderTheoreticalY;
+	const int layerOverAppliedX = depthAwareBackgroundActive ? 0 : layerOverTheoreticalX;
+	const int layerOverAppliedY = depthAwareBackgroundActive ? 0 : layerOverTheoreticalY;
 
 	Common::String trackedActorName;
 	Common::Point actorP1(-1, -1);
 	Common::Point actorP2(-1, -1);
+	int trackedActorBBoxValid = 0;
 	Actor *trackedActor = _selectedActor;
 	if (!trackedActor) {
 		for (Actor *actor : _activeActors) {
@@ -2068,31 +2150,138 @@ void GrimEngine::writeParallaxDebugLogFrame() {
 	if (trackedActor) {
 		trackedActorName = trackedActor->getName();
 		g_driver->getActorScreenBBox(trackedActor, actorP1, actorP2);
+		trackedActorBBoxValid = parallaxDebugIsUsableActorBBox(actorP1, actorP2, g_driver->getScreenWidth(), g_driver->getScreenHeight()) ? 1 : 0;
+		if (!trackedActorBBoxValid) {
+			actorP1 = Common::Point(-1, -1);
+			actorP2 = Common::Point(-1, -1);
+		}
 	}
 
-	Common::String line = Common::String::format(
-		"%u,%u,%s,%.6f,%.6f,%.6f,%.6f,%.6f,"
-		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-		"%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,"
-		"%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d,%d,%d,"
-		"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-		"%.6f,%.6f,%.6f,%s,%s\n",
-		_parallaxDebugLogFrameCounter++, g_system->getMillis(), srcName,
-		_parallaxDebugInputX, _parallaxDebugInputY, _parallaxDebugStrength, planeShift.getX(), planeShift.getY(),
-		cameraPos.x(), cameraPos.y(), cameraPos.z(), cameraInterest.x(), cameraInterest.y(), cameraInterest.z(),
-		cameraPosFinal.x(), cameraPosFinal.y(), cameraPosFinal.z(), cameraInterestFinal.x(), cameraInterestFinal.y(), cameraInterestFinal.z(),
-		cameraOffset.x(), cameraOffset.y(), cameraOffset.z(), fov, roll, screenPlaneDistance,
-		frustumShiftNearX, frustumShiftNearY, frustumLeft, frustumRight, frustumBottom, frustumTop,
-		depthAwareBackgroundActive ? 1 : 0,
-		bgShiftNear.getX(), bgShiftNear.getY(), bgShiftZero.getX(), bgShiftZero.getY(), bgShiftFar.getX(), bgShiftFar.getY(), bgOffX, bgOffY,
-		layerBgX, layerBgY, layerStateX, layerStateY, layerUnderX, layerUnderY, layerOverX, layerOverY,
-		trackedActorName.c_str(), actorP1.x, actorP1.y, actorP2.x, actorP2.y,
-		_parallaxDebugOpentrackPose[0], _parallaxDebugOpentrackPose[1], _parallaxDebugOpentrackPose[2],
-		_parallaxDebugOpentrackPose[3], _parallaxDebugOpentrackPose[4], _parallaxDebugOpentrackPose[5],
-		_parallaxDebugOpentrackCenter[0], _parallaxDebugOpentrackCenter[1], _parallaxDebugOpentrackCenter[2],
-		setName.c_str(), setupName.c_str());
+	const Common::String trackedActorNameCsv = parallaxDebugSanitizeCsvField(trackedActorName);
+	const Common::String setNameCsv = parallaxDebugSanitizeCsvField(setName);
+	const Common::String setupNameCsv = parallaxDebugSanitizeCsvField(setupName);
+	const Common::String layeredStatusCsv = parallaxDebugSanitizeCsvField(_parallaxDebugLayeredStatus);
+	const Common::String layeredManifestPathCsv = parallaxDebugSanitizeCsvField(_parallaxDebugLayeredManifestPath);
+	const Common::String layeredSummaryCsv = parallaxDebugSanitizeCsvField(_parallaxDebugLayeredLayerSummary);
+
+	Common::String line;
+	auto appendSeparator = [&line]() {
+		if (!line.empty())
+			line += ",";
+	};
+	auto appendUInt = [&line, &appendSeparator](uint32 value) {
+		appendSeparator();
+		line += Common::String::format("%u", value);
+	};
+	auto appendInt = [&line, &appendSeparator](int value) {
+		appendSeparator();
+		line += Common::String::format("%d", value);
+	};
+	auto appendFloat6 = [&line, &appendSeparator](float value) {
+		appendSeparator();
+		line += Common::String::format("%.6f", value);
+	};
+	auto appendFloat8 = [&line, &appendSeparator](float value) {
+		appendSeparator();
+		line += Common::String::format("%.8f", value);
+	};
+	auto appendDouble6 = [&line, &appendSeparator](double value) {
+		appendSeparator();
+		line += Common::String::format("%.6f", value);
+	};
+	auto appendString = [&line, &appendSeparator](const Common::String &value) {
+		appendSeparator();
+		line += value;
+	};
+
+	appendUInt(_parallaxDebugLogFrameCounter++);
+	appendUInt(g_system->getMillis());
+	appendString(srcName);
+	appendFloat6(_parallaxDebugInputX);
+	appendFloat6(_parallaxDebugInputY);
+	appendFloat6(_parallaxDebugStrength);
+	appendFloat6(planeShift.getX());
+	appendFloat6(planeShift.getY());
+	appendFloat6(cameraPos.x());
+	appendFloat6(cameraPos.y());
+	appendFloat6(cameraPos.z());
+	appendFloat6(cameraInterest.x());
+	appendFloat6(cameraInterest.y());
+	appendFloat6(cameraInterest.z());
+	appendFloat6(cameraPosFinal.x());
+	appendFloat6(cameraPosFinal.y());
+	appendFloat6(cameraPosFinal.z());
+	appendFloat6(cameraInterestFinal.x());
+	appendFloat6(cameraInterestFinal.y());
+	appendFloat6(cameraInterestFinal.z());
+	appendFloat6(cameraOffset.x());
+	appendFloat6(cameraOffset.y());
+	appendFloat6(cameraOffset.z());
+	appendFloat6(fov);
+	appendFloat6(roll);
+	appendFloat6(screenPlaneDistance);
+	appendFloat8(frustumShiftNearX);
+	appendFloat8(frustumShiftNearY);
+	appendFloat8(frustumLeft);
+	appendFloat8(frustumRight);
+	appendFloat8(frustumBottom);
+	appendFloat8(frustumTop);
+	appendInt(depthAwareBackgroundActive ? 1 : 0);
+	appendFloat6(bgShiftNear.getX());
+	appendFloat6(bgShiftNear.getY());
+	appendFloat6(bgShiftZero.getX());
+	appendFloat6(bgShiftZero.getY());
+	appendFloat6(bgShiftFar.getX());
+	appendFloat6(bgShiftFar.getY());
+	appendInt(bgOffAppliedX);
+	appendInt(bgOffAppliedY);
+	appendInt(bgOffTheoreticalX);
+	appendInt(bgOffTheoreticalY);
+	appendInt(layerBgAppliedX);
+	appendInt(layerBgAppliedY);
+	appendInt(layerBgTheoreticalX);
+	appendInt(layerBgTheoreticalY);
+	appendInt(layerStateAppliedX);
+	appendInt(layerStateAppliedY);
+	appendInt(layerStateTheoreticalX);
+	appendInt(layerStateTheoreticalY);
+	appendInt(layerUnderAppliedX);
+	appendInt(layerUnderAppliedY);
+	appendInt(layerUnderTheoreticalX);
+	appendInt(layerUnderTheoreticalY);
+	appendInt(layerOverAppliedX);
+	appendInt(layerOverAppliedY);
+	appendInt(layerOverTheoreticalX);
+	appendInt(layerOverTheoreticalY);
+	appendString(trackedActorNameCsv);
+	appendInt(trackedActorBBoxValid);
+	appendInt(actorP1.x);
+	appendInt(actorP1.y);
+	appendInt(actorP2.x);
+	appendInt(actorP2.y);
+	appendDouble6(_parallaxDebugOpentrackPose[0]);
+	appendDouble6(_parallaxDebugOpentrackPose[1]);
+	appendDouble6(_parallaxDebugOpentrackPose[2]);
+	appendDouble6(_parallaxDebugOpentrackPose[3]);
+	appendDouble6(_parallaxDebugOpentrackPose[4]);
+	appendDouble6(_parallaxDebugOpentrackPose[5]);
+	appendDouble6(_parallaxDebugOpentrackCenter[0]);
+	appendDouble6(_parallaxDebugOpentrackCenter[1]);
+	appendDouble6(_parallaxDebugOpentrackCenter[2]);
+	appendString(setNameCsv);
+	appendString(setupNameCsv);
+	appendString(renderModeName);
+	appendInt(_parallaxDebugLayeredRequested ? 1 : 0);
+	appendInt(_parallaxDebugLayeredLoaded ? 1 : 0);
+	appendInt(_parallaxDebugLayeredFallbackToStatic ? 1 : 0);
+	appendString(layeredStatusCsv);
+	appendString(layeredManifestPathCsv);
+	appendFloat6(_parallaxDebugLayeredBaseFactor);
+	appendInt(_parallaxDebugLayeredBaseOffsetX);
+	appendInt(_parallaxDebugLayeredBaseOffsetY);
+	appendInt(_parallaxDebugLayeredLayerCount);
+	appendString(layeredSummaryCsv);
+	line += "\n";
 	logFile->write(line.c_str(), (uint32)line.size());
 	if ((_parallaxDebugLogFrameCounter % 30) == 0)
 		logFile->flush();
@@ -2115,7 +2304,7 @@ bool GrimEngine::handleParallaxDebugHotkey(const Common::KeyState &key) {
 		// between plain OpenGL and the shader path when the prototype is toggled.
 		_changeHardwareState = true;
 		g_system->displayMessageOnOSD(_parallaxDebugEnabled ?
-			Common::U32String("Grim parallax test on. F7 auto, F8 center, F9 opentrack, F10 CSV, F11 overlay, [ / ] strength.") :
+			Common::U32String("Grim parallax test on. F7 auto, F8 center, F9 opentrack, F10 CSV, F11 overlay, F12 mode, [ / ] strength.") :
 			Common::U32String("Grim parallax test off."));
 		return true;
 
@@ -2162,6 +2351,16 @@ bool GrimEngine::handleParallaxDebugHotkey(const Common::KeyState &key) {
 		g_system->displayMessageOnOSD(_parallaxDebugOverlayEnabled ?
 			Common::U32String("Grim parallax overlay on.") :
 			Common::U32String("Grim parallax overlay off."));
+		return true;
+
+	case Common::KEYCODE_F12:
+		if (!_parallaxDebugEnabled)
+			return true;
+		setParallaxDebugRenderMode(_parallaxDebugRenderMode == kParallaxDebugRenderLayered ?
+			kParallaxDebugRenderWarp : kParallaxDebugRenderLayered);
+		g_system->displayMessageOnOSD(_parallaxDebugRenderMode == kParallaxDebugRenderLayered ?
+			Common::U32String("Grim parallax render mode: layered plates.") :
+			Common::U32String("Grim parallax render mode: depth warp."));
 		return true;
 
 	case Common::KEYCODE_LEFTBRACKET:
@@ -2347,6 +2546,24 @@ void GrimEngine::drawParallaxDebugOverlay() {
 	snprintf(buf, sizeof(buf), "PX src=%s str=%.2f", srcName, _parallaxDebugStrength);
 	g_driver->drawEmergString(x, y, buf, cyan);
 	y += lineH;
+
+	snprintf(buf, sizeof(buf), "PX mode=%s", _parallaxDebugRenderMode == kParallaxDebugRenderLayered ? "layered" : "warp");
+	g_driver->drawEmergString(x, y, buf, cyan);
+	y += lineH;
+
+	if (_parallaxDebugRenderMode == kParallaxDebugRenderLayered) {
+		snprintf(buf, sizeof(buf), "PX layerBg %s load=%d fall=%d n=%d",
+			_parallaxDebugLayeredStatus.empty() ? "idle" : _parallaxDebugLayeredStatus.c_str(),
+			_parallaxDebugLayeredLoaded ? 1 : 0, _parallaxDebugLayeredFallbackToStatic ? 1 : 0, _parallaxDebugLayeredLayerCount);
+		g_driver->drawEmergString(x, y, buf, cyan);
+		y += lineH;
+
+		snprintf(buf, sizeof(buf), "PX layerBg set=%s base=%+.2f @ %+d,%+d",
+			_parallaxDebugLayeredSetupName.empty() ? "-" : _parallaxDebugLayeredSetupName.c_str(),
+			_parallaxDebugLayeredBaseFactor, _parallaxDebugLayeredBaseOffsetX, _parallaxDebugLayeredBaseOffsetY);
+		g_driver->drawEmergString(x, y, buf, cyan);
+		y += lineH;
+	}
 
 	snprintf(buf, sizeof(buf), "PX log=%s file=grim_parallax_debug.csv", _parallaxDebugLogEnabled ? "on" : "off");
 	g_driver->drawEmergString(x, y, buf, cyan);

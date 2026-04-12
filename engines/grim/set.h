@@ -28,6 +28,8 @@
 #include "engines/grim/sector.h"
 #include "engines/grim/objectstate.h"
 
+#include "common/array.h"
+
 #include "math/quat.h"
 #include "math/frustum.h"
 
@@ -43,6 +45,21 @@ struct SetShadow;
 
 class Set : public PoolObject<Set> {
 public:
+	struct LayeredParallaxLayer {
+		Bitmap *bitmap = nullptr;
+		float factor = 1.0f;
+		Common::String name;
+	};
+
+	struct LayeredParallaxBackdrop {
+		Bitmap *baseBitmap = nullptr;
+		float baseFactor = 0.70f;
+		int originX = 0;
+		int originY = 0;
+		Common::Array<LayeredParallaxLayer> layers;
+		Common::String manifestPath;
+	};
+
 	Set(const Common::String &name, Common::SeekableReadStream *data);
 	Set();
 	~Set();
@@ -132,6 +149,10 @@ public:
 
 		Common::String _name;
 		Bitmap::Ptr _bkgndBm, _bkgndZBm;
+		mutable LayeredParallaxBackdrop *_parallaxBackdrop = nullptr;
+		mutable bool _parallaxBackdropLoadAttempted = false;
+		mutable Common::String _parallaxBackdropResolvedManifestPath;
+		mutable Common::String _parallaxBackdropLoadStatus;
 
 		// Camera settings
 		Math::Vector3d _pos, _interest;

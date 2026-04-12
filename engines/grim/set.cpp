@@ -31,9 +31,258 @@
 #include "engines/grim/sound.h"
 #include "engines/grim/emi/sound/emisound.h"
 
+#include "common/config-manager.h"
+#include "common/file.h"
+#include "common/fs.h"
+#include "common/formats/json.h"
 #include "math/frustum.h"
+#include "graphics/surface.h"
+#include "image/png.h"
 
 namespace Grim {
+
+namespace {
+
+static void destroyLayeredParallaxBackdrop(Set::LayeredParallaxBackdrop *backdrop) {
+	if (!backdrop)
+		return;
+
+	delete backdrop->baseBitmap;
+	for (uint i = 0; i < backdrop->layers.size(); ++i) {
+		delete backdrop->layers[i].bitmap;
+	}
+	delete backdrop;
+}
+
+static float jsonNumberOrDefault(const Common::JSONValue *value, float fallback) {
+	if (!value)
+		return fallback;
+	if (value->isIntegerNumber())
+		return (float)value->asIntegerNumber();
+	if (value->isNumber())
+		return (float)value->asNumber();
+	return fallback;
+}
+
+static int jsonIntOrDefault(const Common::JSONValue *value, int fallback) {
+	if (!value)
+		return fallback;
+	if (value->isIntegerNumber())
+		return (int)value->asIntegerNumber();
+	if (value->isNumber())
+		return (int)value->asNumber();
+	return fallback;
+}
+
+static Bitmap *loadBitmapFromPng(const Common::Path &path) {
+	Common::FSNode node(path);
+	if (!node.exists() || node.isDirectory()) {
+		warning("Layered parallax PNG missing: %s", path.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	Common::File file;
+	if (!file.open(node))
+		return nullptr;
+
+	Image::PNGDecoder decoder;
+	if (!decoder.loadStream(file) || !decoder.getSurface()) {
+		warning("Failed to decode layered parallax PNG: %s", path.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	Graphics::Surface surfaceCopy;
+	surfaceCopy.copyFrom(*decoder.getSurface());
+	Bitmap *bitmap = new Bitmap(surfaceCopy, surfaceCopy.w, surfaceCopy.h, path.toString().c_str());
+	surfaceCopy.free();
+	return bitmap;
+}
+
+static Set::LayeredParallaxBackdrop *loadLayeredParallaxBackdropManifest(const Common::Path &manifestPath) {
+	Common::FSNode manifestNode(manifestPath);
+	if (!manifestNode.exists() || manifestNode.isDirectory())
+		return nullptr;
+
+	Common::File file;
+	if (!file.open(manifestNode))
+		return nullptr;
+
+	const int64 manifestSize = file.size();
+	if (manifestSize <= 0 || manifestSize > 16 * 1024 * 1024) {
+		warning("Layered parallax manifest has invalid size: %s", manifestPath.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	char *jsonBytes = new char[(uint32)manifestSize + 1];
+	file.read(jsonBytes, (uint32)manifestSize);
+	jsonBytes[manifestSize] = 0;
+	Common::JSONValue *root = Common::JSON::parse(jsonBytes);
+	delete[] jsonBytes;
+
+	if (!root || !root->isObject()) {
+		delete root;
+		warning("Layered parallax manifest parse failed: %s", manifestPath.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	Set::LayeredParallaxBackdrop *backdrop = new Set::LayeredParallaxBackdrop();
+	backdrop->manifestPath = manifestPath.toString(Common::Path::kNativeSeparator);
+
+	const Common::JSONObject &obj = root->asObject();
+	const Common::JSONValue *originValue = obj.contains("origin") ? obj["origin"] : nullptr;
+	if (originValue && originValue->isObject()) {
+		const Common::JSONObject &origin = originValue->asObject();
+		backdrop->originX = jsonIntOrDefault(origin.contains("x") ? origin["x"] : nullptr, 0);
+		backdrop->originY = jsonIntOrDefault(origin.contains("y") ? origin["y"] : nullptr, 0);
+	}
+
+	const Common::JSONValue *baseValue = obj.contains("base") ? obj["base"] : nullptr;
+	if (!baseValue || !baseValue->isObject()) {
+		delete root;
+		destroyLayeredParallaxBackdrop(backdrop);
+		warning("Layered parallax manifest is missing a base plate: %s", manifestPath.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	const Common::JSONObject &base = baseValue->asObject();
+	if (!base.contains("image") || !base["image"]->isString()) {
+		delete root;
+		destroyLayeredParallaxBackdrop(backdrop);
+		warning("Layered parallax base plate has no image path: %s", manifestPath.toString(Common::Path::kNativeSeparator).c_str());
+		return nullptr;
+	}
+
+	backdrop->baseFactor = jsonNumberOrDefault(base.contains("factor") ? base["factor"] : nullptr, 0.65f);
+	backdrop->baseBitmap = loadBitmapFromPng(manifestPath.getParent().appendComponent(base["image"]->asString()));
+	if (!backdrop->baseBitmap) {
+		delete root;
+		destroyLayeredParallaxBackdrop(backdrop);
+		return nullptr;
+	}
+
+	const Common::JSONValue *layersValue = obj.contains("layers") ? obj["layers"] : nullptr;
+	if (layersValue && layersValue->isArray()) {
+		const Common::JSONArray &layers = layersValue->asArray();
+		for (uint i = 0; i < layers.size(); ++i) {
+			if (!layers[i] || !layers[i]->isObject())
+				continue;
+
+			const Common::JSONObject &layerObject = layers[i]->asObject();
+			if (!layerObject.contains("image") || !layerObject["image"]->isString())
+				continue;
+
+			Set::LayeredParallaxLayer layer;
+			layer.name = layerObject.contains("name") && layerObject["name"]->isString() ? layerObject["name"]->asString() : Common::String::format("layer_%u", i);
+			layer.factor = jsonNumberOrDefault(layerObject.contains("factor") ? layerObject["factor"] : nullptr, 1.0f);
+			layer.bitmap = loadBitmapFromPng(manifestPath.getParent().appendComponent(layerObject["image"]->asString()));
+			if (!layer.bitmap)
+				continue;
+
+			backdrop->layers.push_back(layer);
+		}
+	}
+
+	delete root;
+	return backdrop;
+}
+
+static void addUniqueManifestCandidate(Common::Array<Common::Path> &manifestCandidates, const Common::Path &candidate) {
+	const Common::String candidateString = candidate.toString(Common::Path::kNativeSeparator);
+	for (uint i = 0; i < manifestCandidates.size(); ++i) {
+		if (manifestCandidates[i].toString(Common::Path::kNativeSeparator).equalsIgnoreCase(candidateString))
+			return;
+	}
+
+	manifestCandidates.push_back(candidate);
+}
+
+static bool isNumberedSetupAlias(const Common::String &directoryName, const Common::String &setupName) {
+	const uint32 setupSep = setupName.find('_');
+	if (setupSep == Common::String::npos)
+		return false;
+
+	const Common::String prefix = setupName.substr(0, setupSep);
+	const Common::String suffix = setupName.substr(setupSep + 1);
+	if (prefix.empty() || suffix.empty())
+		return false;
+
+	if (!directoryName.hasPrefixIgnoreCase(prefix + "_"))
+		return false;
+
+	const Common::String remainder = directoryName.substr(prefix.size() + 1);
+	const uint32 remainderSep = remainder.find('_');
+	if (remainderSep == Common::String::npos)
+		return false;
+
+	const Common::String numericPart = remainder.substr(0, remainderSep);
+	const Common::String aliasedSuffix = remainder.substr(remainderSep + 1);
+	if (numericPart.empty() || aliasedSuffix.empty() || !aliasedSuffix.equalsIgnoreCase(suffix))
+		return false;
+
+	for (uint i = 0; i < numericPart.size(); ++i) {
+		if (!Common::isDigit(numericPart[i]))
+			return false;
+	}
+
+	return true;
+}
+
+static void addManifestCandidatesForRoot(Common::Array<Common::Path> &manifestCandidates, const Common::Path &rootPath, const Common::String &setupName) {
+	addUniqueManifestCandidate(manifestCandidates, rootPath.appendComponent(setupName).appendComponent("manifest.json"));
+
+	Common::FSNode rootNode(rootPath);
+	if (!rootNode.exists() || !rootNode.isDirectory())
+		return;
+
+	Common::FSList children;
+	if (!rootNode.getChildren(children, Common::FSNode::kListDirectoriesOnly))
+		return;
+
+	for (Common::FSList::const_iterator it = children.begin(); it != children.end(); ++it) {
+		if (!isNumberedSetupAlias((*it).getName(), setupName))
+			continue;
+		addUniqueManifestCandidate(manifestCandidates, (*it).getPath().appendComponent("manifest.json"));
+	}
+}
+
+static Set::LayeredParallaxBackdrop *loadLayeredParallaxBackdropForSetup(const Set::Setup &setup) {
+	if (setup._parallaxBackdropLoadAttempted)
+		return setup._parallaxBackdrop;
+
+	setup._parallaxBackdropLoadAttempted = true;
+	setup._parallaxBackdropResolvedManifestPath.clear();
+	setup._parallaxBackdropLoadStatus = "not_found";
+
+	const Common::Path gamePath = ConfMan.getPath("path");
+	Common::FSNode gamePathNode(gamePath);
+	Common::Array<Common::Path> manifestCandidates;
+	addManifestCandidatesForRoot(manifestCandidates, gamePath.appendComponent("parallax_layers"), setup._name);
+	addManifestCandidatesForRoot(manifestCandidates, gamePath.appendComponent("GRIMDATA").appendComponent("parallax_layers"), setup._name);
+	addManifestCandidatesForRoot(manifestCandidates, gamePath.getParent().appendComponent("parallax_layers"), setup._name);
+	if (gamePathNode.exists() && gamePathNode.isDirectory()) {
+		const Common::FSNode parentNode = gamePathNode.getParent();
+		if (parentNode.exists() && parentNode.isDirectory())
+			addManifestCandidatesForRoot(manifestCandidates, parentNode.getPath().appendComponent("parallax_layers"), setup._name);
+	}
+
+	for (uint i = 0; i < manifestCandidates.size(); ++i) {
+		Common::FSNode manifestNode(manifestCandidates[i]);
+		if (!manifestNode.exists() || manifestNode.isDirectory())
+			continue;
+
+		setup._parallaxBackdropResolvedManifestPath = manifestCandidates[i].toString(Common::Path::kNativeSeparator);
+		setup._parallaxBackdropLoadStatus = "load_failed";
+		setup._parallaxBackdrop = loadLayeredParallaxBackdropManifest(manifestCandidates[i]);
+		if (setup._parallaxBackdrop) {
+			setup._parallaxBackdropLoadStatus = "loaded";
+			return setup._parallaxBackdrop;
+		}
+	}
+
+	return nullptr;
+}
+
+} // namespace
 
 Set::Set(const Common::String &sceneName, Common::SeekableReadStream *data) :
 		_locked(false), _name(sceneName), _enableLights(false) {
@@ -62,6 +311,7 @@ Set::~Set() {
 	if (_cmaps || g_grim->getGameType() == GType_MONKEY4) {
 		delete[] _cmaps;
 		for (int i = 0; i < _numSetups; ++i) {
+			destroyLayeredParallaxBackdrop(_setups[i]._parallaxBackdrop);
 			delete _setups[i]._bkgndBm;
 			delete _setups[i]._bkgndZBm;
 		}
@@ -887,15 +1137,21 @@ Bitmap::Ptr Set::loadBackground(const char *fileName) {
 }
 
 void Set::drawBackground() const {
+	const bool useLayeredBackground = g_grim->isParallaxDebugEnabled() &&
+		g_grim->getGameType() == GType_GRIM &&
+		g_grim->getParallaxDebugRenderMode() == GrimEngine::kParallaxDebugRenderLayered &&
+		_currSetup &&
+		_currSetup->_bkgndBm;
 	const bool useDepthAwareBackground = g_grim->isParallaxDebugEnabled() &&
 		g_grim->getGameType() == GType_GRIM &&
+		g_grim->getParallaxDebugRenderMode() == GrimEngine::kParallaxDebugRenderWarp &&
 		g_driver->supportsShaders() &&
 		_currSetup->_bkgndBm &&
 		_currSetup->_bkgndZBm;
 
 	int offsetX = 0;
 	int offsetY = 0;
-	if (!useDepthAwareBackground)
+	if (!useDepthAwareBackground && !useLayeredBackground)
 		g_grim->getParallaxDebugScreenOffset(0.70f, offsetX, offsetY);
 
 	if (_currSetup->_bkgndZBm) // Some screens have no zbuffer mask (eg, Alley)
@@ -910,11 +1166,46 @@ void Set::drawBackground() const {
 		const int drawX = _currSetup->_bkgndBm->getBitmapData()->_x + offsetX;
 		const int drawY = _currSetup->_bkgndBm->getBitmapData()->_y + offsetY;
 
-		if (useDepthAwareBackground) {
+		if (useLayeredBackground) {
+			LayeredParallaxBackdrop *layered = loadLayeredParallaxBackdropForSetup(*_currSetup);
+			if (layered && layered->baseBitmap) {
+				int baseOffsetX = 0;
+				int baseOffsetY = 0;
+				g_grim->getParallaxDebugScreenOffset(layered->baseFactor, baseOffsetX, baseOffsetY);
+				layered->baseBitmap->draw(layered->originX + baseOffsetX, layered->originY + baseOffsetY);
+
+				Common::String layerSummary = Common::String::format("base@(%d:%d)f=%.4f", baseOffsetX, baseOffsetY, layered->baseFactor);
+
+				for (uint i = 0; i < layered->layers.size(); ++i) {
+					if (!layered->layers[i].bitmap)
+						continue;
+					int layerOffsetX = 0;
+					int layerOffsetY = 0;
+					g_grim->getParallaxDebugScreenOffset(layered->layers[i].factor, layerOffsetX, layerOffsetY);
+					layered->layers[i].bitmap->draw(layered->originX + layerOffsetX, layered->originY + layerOffsetY);
+					layerSummary += Common::String::format("|%s@(%d:%d)f=%.4f",
+						layered->layers[i].name.c_str(), layerOffsetX, layerOffsetY, layered->layers[i].factor);
+				}
+
+				g_grim->updateParallaxDebugLayeredFrameState(_currSetup->_name, true, true, false,
+					_currSetup->_parallaxBackdropLoadStatus.empty() ? "loaded" : _currSetup->_parallaxBackdropLoadStatus,
+					layered->manifestPath, layered->baseFactor, baseOffsetX, baseOffsetY, layered->layers.size(), layerSummary);
+				return;
+			}
+
+			g_grim->updateParallaxDebugLayeredFrameState(_currSetup->_name, true, false, true,
+				_currSetup->_parallaxBackdropLoadStatus.empty() ? "missing" : _currSetup->_parallaxBackdropLoadStatus,
+				_currSetup->_parallaxBackdropResolvedManifestPath, 0.0f, 0, 0, 0, Common::String("fallback_static_room_bitmap"));
+			_currSetup->_bkgndBm->draw(drawX, drawY);
+		} else if (useDepthAwareBackground) {
+			g_grim->updateParallaxDebugLayeredFrameState(_currSetup->_name, false, false, false,
+				"warp_mode", Common::String(), 0.0f, 0, 0, 0, Common::String());
 			const Math::Vector2d cameraPlaneShift = g_grim->getParallaxDebugCameraPlaneOffset();
 			const float screenPlaneDistance = MAX((_currSetup->_interest - _currSetup->_pos).getMagnitude(), 0.01f);
 			g_driver->drawDepthAwareBackground(_currSetup->_bkgndBm, drawX, drawY, cameraPlaneShift, _currSetup->_fov, 0.01f, 3276.8f, screenPlaneDistance);
 		} else {
+			g_grim->updateParallaxDebugLayeredFrameState(_currSetup->_name, false, false, false,
+				"static_mode", Common::String(), 0.0f, 0, 0, 0, Common::String());
 			_currSetup->_bkgndBm->draw(drawX, drawY);
 		}
 	}
@@ -925,6 +1216,7 @@ void Set::drawBitmaps(ObjectState::Position stage) {
 	int offsetY = 0;
 	const bool useDepthAwareBackground = g_grim->isParallaxDebugEnabled() &&
 		g_grim->getGameType() == GType_GRIM &&
+		g_grim->getParallaxDebugRenderMode() == GrimEngine::kParallaxDebugRenderWarp &&
 		g_driver->supportsShaders() &&
 		_currSetup->_bkgndBm &&
 		_currSetup->_bkgndZBm;

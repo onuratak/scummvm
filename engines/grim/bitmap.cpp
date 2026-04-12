@@ -186,6 +186,18 @@ BitmapData::BitmapData(const Graphics::Surface &buf, int w, int h, const char *f
 	_hasTransparency = false;
 	_data = new Graphics::Surface[_numImages];
 	_data[0].copyFrom(buf);
+	if (_data[0].format.aBits() > 0) {
+		for (int i = 0; i < _width * _height; ++i) {
+			byte a, r, g, b;
+			const int x = i % _width;
+			const int y = i / _width;
+			_data[0].format.colorToARGB(_data[0].getPixel(x, y), a, r, g, b);
+			if (a != 0xFF) {
+				_hasTransparency = true;
+				break;
+			}
+		}
+	}
 	_loaded = true;
 	_keepData = true;
 

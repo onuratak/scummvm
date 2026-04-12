@@ -23,27 +23,63 @@ float linearizeDepth(float depth) {
 	return (2.0 * cameraNearClip * cameraFarClip) / denom;
 }
 
+float sampleSceneZ(vec2 screenUv) {
+	vec2 sampled = texture(texZBuf, clamp(screenUv, vec2(0.0), vec2(1.0)) * texcropZBuf).ra;
+	// The 16-bit Z value V = H*256+L is reconstructed as V/65280 from
+	// the luminance-alpha texture, but true [0,1] depth is V/65535.
+	// Scale by 256/257 (= 65280/65535) to match gl_FragCoord.z space.
+	// (This is the reciprocal of the 1.0039 bias in the actor depth test.)
+	return (sampled.y + sampled.x / 256.0) * (256.0 / 257.0);
+}
+
+float sampleLinearDepth(vec2 screenUv) {
+	return linearizeDepth(sampleSceneZ(screenUv));
+}
+
+float edgeDistance01(vec2 uv, vec2 crop) {
+	vec2 normalizedUv = uv / max(crop, vec2(0.0001));
+	vec2 edgeDistance = min(normalizedUv, vec2(1.0) - normalizedUv);
+	return min(edgeDistance.x, edgeDistance.y);
+}
+
 void main() {
 	vec2 sampleUv = Texcoord;
 
 	if (UBOOL_TEST(useParallax)) {
 		vec2 zCoord = vec2((gl_FragCoord.x - 0.5) / screenSize.x, 1.0 - (gl_FragCoord.y - 0.5) / screenSize.y);
-		vec2 sampled = texture(texZBuf, zCoord * texcropZBuf).ra;
-		// The 16-bit Z value V = H*256+L is reconstructed as V/65280 from
-		// the luminance-alpha texture, but true [0,1] depth is V/65535.
-		// Scale by 256/257 (= 65280/65535) to match gl_FragCoord.z space.
-		// (This is the reciprocal of the 1.0039 bias in the actor depth test.)
-		float sceneZ = (sampled.y + sampled.x / 256.0) * (256.0 / 257.0);
-		float linearDepth = linearizeDepth(sceneZ);
+		vec2 zPixel = vec2(1.0) / max(screenSize, vec2(1.0));
+		float linearDepthCenter = sampleLinearDepth(zCoord);
+		float linearDepthRight = sampleLinearDepth(zCoord + vec2( zPixel.x, 0.0));
+		float linearDepthLeft = sampleLinearDepth(zCoord + vec2(-zPixel.x, 0.0));
+		float linearDepthUp = sampleLinearDepth(zCoord + vec2(0.0,  zPixel.y));
+		float linearDepthDown = sampleLinearDepth(zCoord + vec2(0.0, -zPixel.y));
+		float linearDepth = (linearDepthCenter * 4.0 +
+			linearDepthRight + linearDepthLeft +
+			linearDepthUp + linearDepthDown) / 8.0;
 		float tanHalfFovX = tan(radians(cameraHFovDegrees) * 0.5);
 		float tanHalfFovY = tanHalfFovX * 0.75;
 		vec2 drawSizePixels = max(screenSize * sizeWH, vec2(1.0));
 		float depthFactor = (1.0 / max(screenPlaneDistance, 0.0001)) - (1.0 / max(linearDepth, 0.0001));
 		vec2 screenShiftPixels = vec2(
 			(cameraPlaneShift.x * screenSize.x * 0.5) * depthFactor / max(tanHalfFovX, 0.0001),
-			(cameraPlaneShift.y * screenSize.y * 0.5) * depthFactor / max(tanHalfFovY, 0.0001)
+			(-cameraPlaneShift.y * screenSize.y * 0.5) * depthFactor / max(tanHalfFovY, 0.0001)
 		);
-		sampleUv = clamp(Texcoord - (screenShiftPixels / drawSizePixels) * texcrop, vec2(0.0), texcrop);
+
+		// Depth discontinuities and image borders do not contain hidden color
+		// information, so damp the warp there instead of stretching the room.
+		float maxDepthDiff = 0.0;
+		maxDepthDiff = max(maxDepthDiff, abs(linearDepthCenter - linearDepthRight));
+		maxDepthDiff = max(maxDepthDiff, abs(linearDepthCenter - linearDepthLeft));
+		maxDepthDiff = max(maxDepthDiff, abs(linearDepthCenter - linearDepthUp));
+		maxDepthDiff = max(maxDepthDiff, abs(linearDepthCenter - linearDepthDown));
+		float relativeDepthDiff = maxDepthDiff / max(linearDepthCenter, 0.0001);
+		float depthEdgeDamping = 1.0 - smoothstep(0.02, 0.08, relativeDepthDiff);
+
+		vec2 shiftedUv = clamp(Texcoord - (screenShiftPixels / drawSizePixels) * texcrop, vec2(0.0), texcrop);
+		float borderDamping = smoothstep(0.025, 0.10, min(edgeDistance01(Texcoord, texcrop), edgeDistance01(shiftedUv, texcrop)));
+		float nearDamping = smoothstep(screenPlaneDistance * 0.18, screenPlaneDistance * 0.45, linearDepth);
+		float parallaxWeight = depthEdgeDamping * borderDamping * nearDamping;
+		sampleUv = mix(Texcoord, shiftedUv, parallaxWeight);
 	}
 
 	outColor = texture(tex, sampleUv);

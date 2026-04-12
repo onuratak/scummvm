@@ -81,6 +81,10 @@ public:
 		kParallaxDebugInputAuto = 1,
 		kParallaxDebugInputOpentrack = 2
 	};
+	enum ParallaxDebugRenderMode {
+		kParallaxDebugRenderWarp = 0,
+		kParallaxDebugRenderLayered = 1
+	};
 
 	GrimEngine(OSystem *syst, uint32 gameFlags, GrimGameType gameType, Common::Platform platform, Common::Language language);
 	virtual ~GrimEngine();
@@ -198,11 +202,16 @@ public:
 	Math::Vector3d getParallaxDebugCameraOffset(const Math::Vector3d &pos, const Math::Vector3d &interest, float roll) const;
 	Math::Vector2d getParallaxDebugCameraPlaneOffset() const;
 	void getParallaxDebugScreenOffset(float factor, int &x, int &y) const;
+	void setParallaxDebugRenderMode(ParallaxDebugRenderMode mode);
 	bool toggleParallaxDebugLog();
 	void closeParallaxDebugLog();
+	void updateParallaxDebugLayeredFrameState(const Common::String &setupName, bool requested, bool loaded, bool fallbackToStatic,
+		const Common::String &status, const Common::String &manifestPath, float baseFactor, int baseOffsetX, int baseOffsetY,
+		int layerCount, const Common::String &layerSummary);
 	void writeParallaxDebugLogFrame();
 	bool isParallaxDebugEnabled() const { return _parallaxDebugEnabled; }
 	bool isParallaxDebugOverlayEnabled() const { return _parallaxDebugOverlayEnabled; }
+	ParallaxDebugRenderMode getParallaxDebugRenderMode() const { return _parallaxDebugRenderMode; }
 	void drawParallaxDebugOverlay();
 	float getParallaxDebugInputX() const { return _parallaxDebugInputX; }
 	float getParallaxDebugInputY() const { return _parallaxDebugInputY; }
@@ -292,6 +301,7 @@ protected:
 	bool _changeHardwareState = false;
 	bool _parallaxDebugEnabled = false;
 	ParallaxDebugInputSource _parallaxDebugInputSource = kParallaxDebugInputMouse;
+	ParallaxDebugRenderMode _parallaxDebugRenderMode = kParallaxDebugRenderWarp;
 	float _parallaxDebugInputX = 0.0f;
 	float _parallaxDebugInputY = 0.0f;
 	float _parallaxDebugStrength = 0.35f;
@@ -304,13 +314,24 @@ protected:
 	bool _parallaxDebugOpentrackAnnounced = false;
 	bool _parallaxDebugOverlayEnabled = true;
 	bool _parallaxDebugLogEnabled = false;
+	bool _parallaxDebugLayeredRequested = false;
+	bool _parallaxDebugLayeredLoaded = false;
+	bool _parallaxDebugLayeredFallbackToStatic = false;
 	uint32 _parallaxDebugOpentrackLastPacketMillis = 0;
 	uint32 _parallaxDebugLogFrameCounter = 0;
+	float _parallaxDebugLayeredBaseFactor = 0.0f;
+	int _parallaxDebugLayeredBaseOffsetX = 0;
+	int _parallaxDebugLayeredBaseOffsetY = 0;
+	int _parallaxDebugLayeredLayerCount = 0;
 	void *_parallaxDebugOpentrackSocket = nullptr;
 	void *_parallaxDebugOpentrackPacket = nullptr;
 	void *_parallaxDebugLogFile = nullptr;
 	double _parallaxDebugOpentrackPose[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 	double _parallaxDebugOpentrackCenter[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+	Common::String _parallaxDebugLayeredSetupName;
+	Common::String _parallaxDebugLayeredStatus;
+	Common::String _parallaxDebugLayeredManifestPath;
+	Common::String _parallaxDebugLayeredLayerSummary;
 
 	Actor *_selectedActor;
 	Iris *_iris;

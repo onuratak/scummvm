@@ -35,6 +35,8 @@
  * all copies or substantial portions of the Software.
  */
 
+#include <cmath>
+
 #include "common/endian.h"
 #include "common/file.h"
 #include "common/str.h"
@@ -699,9 +701,10 @@ void GfxOpenGLS::getActorScreenBBox(const Actor *actor, Common::Point &p1, Commo
 	p1.y = 1000;
 	p2.x = -1000;
 	p2.y = -1000;
+	int validPoints = 0;
 
 	// Project all of the points in the 3D bounding box
-	Math::Vector3d p, projected;
+	Math::Vector3d p;
 	for (int x = 0; x < 2; x++) {
 		for (int y = 0; y < 2; y++) {
 			for (int z = 0; z < 2; z++) {
@@ -711,12 +714,15 @@ void GfxOpenGLS::getActorScreenBBox(const Actor *actor, Common::Point &p1, Commo
 
 				Math::Vector4d v = Math::Vector4d(p.x(), p.y(), p.z(), 1.0f);
 				v = _projMatrix.transform(modelView.transform(v));
-				if (v.w() == 0.0)
-					return;
+				if (v.w() <= 0.0)
+					continue;
 				v /= v.w();
+				if (!std::isfinite(v.x()) || !std::isfinite(v.y()))
+					continue;
 
 				double winX = (1 + v.x()) / 2.0f * _gameWidth;
 				double winY = (1 + v.y()) / 2.0f * _gameHeight;
+				++validPoints;
 
 				// Find the points
 				if (winX < p1.x)
@@ -731,10 +737,18 @@ void GfxOpenGLS::getActorScreenBBox(const Actor *actor, Common::Point &p1, Commo
 		}
 	}
 
+	if (validPoints == 0) {
+		p1.x = 1000;
+		p1.y = 1000;
+		p2.x = -1000;
+		p2.y = -1000;
+		return;
+	}
+
 	// Swap the p1/p2 y coorindates
 	int16 tmp = p1.y;
-	p1.y = 480 - p2.y;
-	p2.y = 480 - tmp;
+	p1.y = _gameHeight - p2.y;
+	p2.y = _gameHeight - tmp;
 }
 
 void GfxOpenGLS::startActorDraw(const Actor *actor) {
@@ -1408,6 +1422,16 @@ void GfxOpenGLS::createBitmap(BitmapData *bitmap) {
 				texOut = (const byte *)imageData.getPixels();
 			} else {
 				texOut = (const byte *)imageData.getPixels();
+			}
+
+			if (bitmap->_format == 1 && bitmap->getImageData(pic).format.aBits() > 0) {
+				const byte *alphaScan = texOut + 3;
+				for (int i = 0; i < bitmap->_width * bitmap->_height; ++i, alphaScan += 4) {
+					if (*alphaScan != 0xFF) {
+						bitmap->_hasTransparency = true;
+						break;
+					}
+				}
 			}
 
 			int actualWidth = nextHigher2(bitmap->_width);
